@@ -221,22 +221,45 @@ func (s *System) tunLoop() {
 }
 
 func (s *System) wintunLoop(winTun WinTun) {
+	batchTun, _ := winTun.(WinTunBatch)
 	for {
-		packet, release, err := winTun.ReadPacket()
+		err := winTun.ReadFunc(func(packet []byte) {
+			if len(packet) < header.IPv4MinimumSize {
+				return
+			}
+			if s.processPacket(packet) {
+				_, werr := winTun.Write(packet)
+				if werr != nil {
+					s.logger.Trace(E.Cause(werr, "write packet"))
+				}
+			}
+		})
 		if err != nil {
 			return
 		}
-		if len(packet) < header.IPv4MinimumSize {
-			release()
+		if batchTun == nil {
 			continue
 		}
-		if s.processPacket(packet) {
-			_, err = winTun.Write(packet)
+		for {
+			packet, release, ok, err := batchTun.TryReadPacket()
 			if err != nil {
-				s.logger.Trace(E.Cause(err, "write packet"))
+				return
 			}
+			if !ok {
+				break
+			}
+			if len(packet) < header.IPv4MinimumSize {
+				release()
+				continue
+			}
+			if s.processPacket(packet) {
+				_, err = winTun.Write(packet)
+				if err != nil {
+					s.logger.Trace(E.Cause(err, "write packet"))
+				}
+			}
+			release()
 		}
-		release()
 	}
 }
 

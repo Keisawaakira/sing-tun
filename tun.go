@@ -49,6 +49,12 @@ type Tun interface {
 type WinTun interface {
 	Tun
 	ReadPacket() ([]byte, func(), error)
+	ReadFunc(block func(b []byte)) error
+}
+
+type WinTunBatch interface {
+	WinTun
+	TryReadPacket() ([]byte, func(), bool, error)
 }
 
 type LinuxTUN interface {
