@@ -65,44 +65,62 @@ func (e *WintunEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 }
 
 func (e *WintunEndpoint) dispatchLoop() {
+	batchTun, _ := any(e.tun).(WinTunBatch)
 	for {
-		var packetBuffer buffer.Buffer
-		err := e.tun.ReadFunc(func(b []byte) {
-			packetBuffer = buffer.MakeWithData(b)
-		})
+		packet, release, err := e.tun.ReadPacket()
 		if err != nil {
 			break
 		}
-		ihl, ok := packetBuffer.PullUp(0, 1)
-		if !ok {
-			packetBuffer.Release()
+		e.dispatchPacket(packet)
+		release()
+		if batchTun == nil {
 			continue
 		}
-		var networkProtocol tcpip.NetworkProtocolNumber
-		switch header.IPVersion(ihl.AsSlice()) {
-		case header.IPv4Version:
-			networkProtocol = header.IPv4ProtocolNumber
-		case header.IPv6Version:
-			networkProtocol = header.IPv6ProtocolNumber
-		default:
-			e.tun.Write(packetBuffer.Flatten())
-			packetBuffer.Release()
-			continue
+		for {
+			packet, release, ok, err := batchTun.TryReadPacket()
+			if err != nil {
+				return
+			}
+			if !ok {
+				break
+			}
+			e.dispatchPacket(packet)
+			release()
 		}
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload:           packetBuffer,
-			IsForwardedPacket: true,
-		})
-		e.mu.RLock()
-		dispatcher := e.dispatcher
-		e.mu.RUnlock()
-		if dispatcher == nil {
-			pkt.DecRef()
-			return
-		}
-		dispatcher.DeliverNetworkPacket(networkProtocol, pkt)
-		pkt.DecRef()
 	}
+}
+
+func (e *WintunEndpoint) dispatchPacket(packet []byte) {
+	packetBuffer := buffer.MakeWithData(packet)
+	ihl, ok := packetBuffer.PullUp(0, 1)
+	if !ok {
+		packetBuffer.Release()
+		return
+	}
+	var networkProtocol tcpip.NetworkProtocolNumber
+	switch header.IPVersion(ihl.AsSlice()) {
+	case header.IPv4Version:
+		networkProtocol = header.IPv4ProtocolNumber
+	case header.IPv6Version:
+		networkProtocol = header.IPv6ProtocolNumber
+	default:
+		e.tun.Write(packetBuffer.Flatten())
+		packetBuffer.Release()
+		return
+	}
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload:           packetBuffer,
+		IsForwardedPacket: true,
+	})
+	e.mu.RLock()
+	dispatcher := e.dispatcher
+	e.mu.RUnlock()
+	if dispatcher == nil {
+		pkt.DecRef()
+		return
+	}
+	dispatcher.DeliverNetworkPacket(networkProtocol, pkt)
+	pkt.DecRef()
 }
 
 func (e *WintunEndpoint) IsAttached() bool {

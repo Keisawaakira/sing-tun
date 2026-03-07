@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	tcpip "github.com/metacubex/sing-tun/internal/gtcpip"
 	"github.com/metacubex/sing-tun/internal/gtcpip/checksum"
 	"github.com/metacubex/sing-tun/internal/gtcpip/header"
 	"github.com/metacubex/sing/common"
@@ -218,22 +219,45 @@ func (s *System) tunLoop() {
 }
 
 func (s *System) wintunLoop(winTun WinTun) {
+	batchTun, _ := winTun.(WinTunBatch)
 	for {
-		packet, release, err := winTun.ReadPacket()
+		err := winTun.ReadFunc(func(packet []byte) {
+			if len(packet) < header.IPv4MinimumSize {
+				return
+			}
+			if s.processPacket(packet) {
+				_, werr := winTun.Write(packet)
+				if werr != nil {
+					s.logger.Trace(E.Cause(werr, "write packet"))
+				}
+			}
+		})
 		if err != nil {
 			return
 		}
-		if len(packet) < header.IPv4MinimumSize {
-			release()
+		if batchTun == nil {
 			continue
 		}
-		if s.processPacket(packet) {
-			_, err = winTun.Write(packet)
+		for {
+			packet, release, ok, err := batchTun.TryReadPacket()
 			if err != nil {
-				s.logger.Trace(E.Cause(err, "write packet"))
+				return
 			}
+			if !ok {
+				break
+			}
+			if len(packet) < header.IPv4MinimumSize {
+				release()
+				continue
+			}
+			if s.processPacket(packet) {
+				_, err = winTun.Write(packet)
+				if err != nil {
+					s.logger.Trace(E.Cause(err, "write packet"))
+				}
+			}
+			release()
 		}
-		release()
 	}
 }
 
@@ -398,6 +422,56 @@ func (s *System) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 	return
 }
 
+func transportAddress(addr netip.Addr) tcpip.Address {
+	if addr.Is6() {
+		return tcpip.AddrFrom16(addr.As16())
+	}
+	return tcpip.AddrFrom4(addr.As4())
+}
+
+func (s *System) rewriteIPv4TCPPacket(ipHdr header.IPv4, tcpHdr header.TCP, source, destination netip.AddrPort) {
+	if s.txChecksumOffload {
+		ipHdr.SetSourceAddr(source.Addr())
+		tcpHdr.SetSourcePort(source.Port())
+		ipHdr.SetDestinationAddr(destination.Addr())
+		tcpHdr.SetDestinationPort(destination.Port())
+		tcpHdr.SetChecksum(0)
+		ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
+		return
+	}
+
+	sourceAddr := transportAddress(source.Addr())
+	tcpHdr.UpdateChecksumPseudoHeaderAddress(ipHdr.SourceAddress(), sourceAddr, true)
+	tcpHdr.SetSourcePortWithChecksumUpdate(source.Port())
+	ipHdr.SetSourceAddressWithChecksumUpdate(sourceAddr)
+
+	destinationAddr := transportAddress(destination.Addr())
+	tcpHdr.UpdateChecksumPseudoHeaderAddress(ipHdr.DestinationAddress(), destinationAddr, true)
+	tcpHdr.SetDestinationPortWithChecksumUpdate(destination.Port())
+	ipHdr.SetDestinationAddressWithChecksumUpdate(destinationAddr)
+}
+
+func (s *System) rewriteIPv6TCPPacket(ipHdr header.IPv6, tcpHdr header.TCP, source, destination netip.AddrPort) {
+	if s.txChecksumOffload {
+		ipHdr.SetSourceAddr(source.Addr())
+		tcpHdr.SetSourcePort(source.Port())
+		ipHdr.SetDestinationAddr(destination.Addr())
+		tcpHdr.SetDestinationPort(destination.Port())
+		tcpHdr.SetChecksum(0)
+		return
+	}
+
+	sourceAddr := transportAddress(source.Addr())
+	tcpHdr.UpdateChecksumPseudoHeaderAddress(ipHdr.SourceAddress(), sourceAddr, true)
+	tcpHdr.SetSourcePortWithChecksumUpdate(source.Port())
+	ipHdr.SetSourceAddress(sourceAddr)
+
+	destinationAddr := transportAddress(destination.Addr())
+	tcpHdr.UpdateChecksumPseudoHeaderAddress(ipHdr.DestinationAddress(), destinationAddr, true)
+	tcpHdr.SetDestinationPortWithChecksumUpdate(destination.Port())
+	ipHdr.SetDestinationAddress(destinationAddr)
+}
+
 func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, error) {
 	source := netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.SourcePort())
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
@@ -408,36 +482,25 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 		if session == nil {
 			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
 		}
-		ipHdr.SetSourceAddr(session.Destination.Addr())
-		tcpHdr.SetSourcePort(session.Destination.Port())
-		ipHdr.SetDestinationAddr(session.Source.Addr())
-		tcpHdr.SetDestinationPort(session.Source.Port())
+		source = session.Destination
+		destination = session.Source
 	} else {
 		var loopback bool
 		for _, inet4LoopbackAddress := range s.inet4LoopbackAddress {
 			if destination.Addr() == inet4LoopbackAddress {
-				ipHdr.SetDestinationAddr(ipHdr.SourceAddr())
-				ipHdr.SetSourceAddr(inet4LoopbackAddress)
+				destination = netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.DestinationPort())
+				source = netip.AddrPortFrom(inet4LoopbackAddress, tcpHdr.SourcePort())
 				loopback = true
 				break
 			}
 		}
 		if !loopback {
 			natPort := s.tcpNat.Lookup(source, destination)
-			ipHdr.SetSourceAddr(s.inet4NextAddress)
-			tcpHdr.SetSourcePort(natPort)
-			ipHdr.SetDestinationAddr(s.inet4Address)
-			tcpHdr.SetDestinationPort(s.tcpPort)
+			source = netip.AddrPortFrom(s.inet4NextAddress, natPort)
+			destination = netip.AddrPortFrom(s.inet4Address, s.tcpPort)
 		}
 	}
-	if !s.txChecksumOffload {
-		tcpHdr.SetChecksum(^checksum.Checksum(tcpHdr.Payload(), tcpHdr.CalculateChecksum(
-			header.PseudoHeaderChecksum(header.TCPProtocolNumber, ipHdr.SourceAddressSlice(), ipHdr.DestinationAddressSlice(), ipHdr.PayloadLength()),
-		)))
-	} else {
-		tcpHdr.SetChecksum(0)
-	}
-	ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
+	s.rewriteIPv4TCPPacket(ipHdr, tcpHdr, source, destination)
 	return true, nil
 }
 
@@ -496,35 +559,25 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 		if session == nil {
 			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
 		}
-		ipHdr.SetSourceAddr(session.Destination.Addr())
-		tcpHdr.SetSourcePort(session.Destination.Port())
-		ipHdr.SetDestinationAddr(session.Source.Addr())
-		tcpHdr.SetDestinationPort(session.Source.Port())
+		source = session.Destination
+		destination = session.Source
 	} else {
 		var loopback bool
 		for _, inet6LoopbackAddress := range s.inet6LoopbackAddress {
 			if destination.Addr() == inet6LoopbackAddress {
-				ipHdr.SetDestinationAddr(ipHdr.SourceAddr())
-				ipHdr.SetSourceAddr(inet6LoopbackAddress)
+				destination = netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.DestinationPort())
+				source = netip.AddrPortFrom(inet6LoopbackAddress, tcpHdr.SourcePort())
 				loopback = true
 				break
 			}
 		}
 		if !loopback {
 			natPort := s.tcpNat.Lookup(source, destination)
-			ipHdr.SetSourceAddr(s.inet6NextAddress)
-			tcpHdr.SetSourcePort(natPort)
-			ipHdr.SetDestinationAddr(s.inet6Address)
-			tcpHdr.SetDestinationPort(s.tcpPort6)
+			source = netip.AddrPortFrom(s.inet6NextAddress, natPort)
+			destination = netip.AddrPortFrom(s.inet6Address, s.tcpPort6)
 		}
 	}
-	if !s.txChecksumOffload {
-		tcpHdr.SetChecksum(^checksum.Checksum(tcpHdr.Payload(), tcpHdr.CalculateChecksum(
-			header.PseudoHeaderChecksum(header.TCPProtocolNumber, ipHdr.SourceAddressSlice(), ipHdr.DestinationAddressSlice(), ipHdr.PayloadLength()),
-		)))
-	} else {
-		tcpHdr.SetChecksum(0)
-	}
+	s.rewriteIPv6TCPPacket(ipHdr, tcpHdr, source, destination)
 	return true, nil
 }
 
