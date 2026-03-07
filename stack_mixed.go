@@ -3,6 +3,8 @@
 package tun
 
 import (
+	"time"
+
 	"github.com/metacubex/gvisor/pkg/buffer"
 	gHdr "github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/link/channel"
@@ -27,6 +29,7 @@ func NewMixed(
 	if err != nil {
 		return nil, err
 	}
+	system.(*System).perf.setLabel("stack:mixed")
 	return &Mixed{
 		System: system.(*System),
 		tun:    system.(*System).tun.(GVisorTun),
@@ -93,22 +96,83 @@ func (m *Mixed) tunLoop() {
 }
 
 func (m *Mixed) wintunLoop(winTun WinTun) {
+	perf := m.perf
+	batchTun, _ := winTun.(WinTunBatch)
 	for {
+		readStart := time.Now()
 		packet, release, err := winTun.ReadPacket()
+		if perf != nil {
+			perf.observeRead(time.Since(readStart), len(packet), err)
+		}
 		if err != nil {
 			return
 		}
 		if len(packet) < header.IPv4MinimumSize {
+			if perf != nil {
+				perf.observeShortPacket()
+			}
 			release()
 			continue
 		}
-		if m.processPacket(packet) {
+		processStart := time.Now()
+		writeBack := m.processPacket(packet)
+		if perf != nil {
+			perf.observeProcess(time.Since(processStart), writeBack)
+		}
+		if writeBack {
+			writeStart := time.Now()
 			_, err = winTun.Write(packet)
+			if perf != nil {
+				perf.observeWrite(time.Since(writeStart), len(packet), err)
+			}
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "write packet"))
 			}
 		}
 		release()
+		if batchTun == nil {
+			continue
+		}
+		for {
+			readStart = time.Now()
+			packet, release, ok, err := batchTun.TryReadPacket()
+			if perf != nil {
+				if ok {
+					perf.observeRead(time.Since(readStart), len(packet), nil)
+				} else if err != nil {
+					perf.observeRead(time.Since(readStart), 0, err)
+				}
+			}
+			if err != nil {
+				return
+			}
+			if !ok {
+				break
+			}
+			if len(packet) < header.IPv4MinimumSize {
+				if perf != nil {
+					perf.observeShortPacket()
+				}
+				release()
+				continue
+			}
+			processStart := time.Now()
+			writeBack := m.processPacket(packet)
+			if perf != nil {
+				perf.observeProcess(time.Since(processStart), writeBack)
+			}
+			if writeBack {
+				writeStart := time.Now()
+				_, err = winTun.Write(packet)
+				if perf != nil {
+					perf.observeWrite(time.Since(writeStart), len(packet), err)
+				}
+				if err != nil {
+					m.logger.Trace(E.Cause(err, "write packet"))
+				}
+			}
+			release()
+		}
 	}
 }
 

@@ -32,6 +32,7 @@ type NativeTun struct {
 	session     wintun.Session
 	readWait    windows.Handle
 	rate        rateJuggler
+	perf        *tunPerfDebug
 	running     sync.WaitGroup
 	closeOnce   sync.Once
 	close       atomic.Int32
@@ -49,8 +50,9 @@ func New(options Options) (WinTun, error) {
 	nativeTun := &NativeTun{
 		adapter: adapter,
 		options: options,
+		perf:    newTunPerfDebug(options.Logger, "wintun:"+options.Name),
 	}
-	session, err := adapter.StartSession(0x800000)
+	session, err := adapter.StartSession(wintun.RingCapacityMax)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +356,17 @@ func (t *NativeTun) configure() error {
 	return nil
 }
 
+func (t *NativeTun) waitReadEvent() {
+	waitStart := nanotime()
+	windows.WaitForSingleObject(t.readWait, windows.INFINITE)
+	t.perf.observeWait(time.Duration(nanotime() - waitStart))
+}
+
+func (t *NativeTun) shouldSpin(start int64) bool {
+	return t.rate.current.Load() >= spinloopRateThreshold &&
+		uint64(start-t.rate.nextStartTime.Load()) <= rateMeasurementGranularity*2
+}
+
 func (t *NativeTun) Read(p []byte) (n int, err error) {
 	t.running.Add(1)
 	defer t.running.Done()
@@ -362,7 +375,7 @@ retry:
 		return 0, os.ErrClosed
 	}
 	start := nanotime()
-	shouldSpin := t.rate.current.Load() >= spinloopRateThreshold && uint64(start-t.rate.nextStartTime.Load()) <= rateMeasurementGranularity*2
+	shouldSpin := t.shouldSpin(start)
 	for {
 		if t.close.Load() == 1 {
 			return 0, os.ErrClosed
@@ -374,19 +387,26 @@ retry:
 			n = copy(p, packet)
 			t.session.ReleaseReceivePacket(packet)
 			t.rate.update(uint64(n))
+			t.perf.observeRead(time.Duration(nanotime()-start), n, nil)
 			return
 		case windows.ERROR_NO_MORE_ITEMS:
-			if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {
-				windows.WaitForSingleObject(t.readWait, windows.INFINITE)
-				goto retry
+			if shouldSpin && uint64(nanotime()-start) < spinloopDuration {
+				spinStart := nanotime()
+				procyield(spinloopCycles)
+				t.perf.observeSpin(time.Duration(nanotime() - spinStart))
+				continue
 			}
-			procyield(1)
-			continue
+			t.waitReadEvent()
+			goto retry
 		case windows.ERROR_HANDLE_EOF:
+			t.perf.observeRead(time.Duration(nanotime()-start), 0, os.ErrClosed)
 			return 0, os.ErrClosed
 		case windows.ERROR_INVALID_DATA:
-			return 0, errors.New("send ring corrupt")
+			err = errors.New("send ring corrupt")
+			t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
+			return 0, err
 		}
+		t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
 		return 0, fmt.Errorf("read failed: %w", err)
 	}
 }
@@ -399,7 +419,7 @@ retry:
 		return nil, nil, os.ErrClosed
 	}
 	start := nanotime()
-	shouldSpin := t.rate.current.Load() >= spinloopRateThreshold && uint64(start-t.rate.nextStartTime.Load()) <= rateMeasurementGranularity*2
+	shouldSpin := t.shouldSpin(start)
 	for {
 		if t.close.Load() == 1 {
 			t.running.Done()
@@ -410,26 +430,69 @@ retry:
 		case nil:
 			packetSize := len(packet)
 			t.rate.update(uint64(packetSize))
+			t.perf.observeRead(time.Duration(nanotime()-start), packetSize, nil)
 			return packet, func() {
 				t.session.ReleaseReceivePacket(packet)
 				t.running.Done()
 			}, nil
 		case windows.ERROR_NO_MORE_ITEMS:
-			if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {
-				windows.WaitForSingleObject(t.readWait, windows.INFINITE)
-				goto retry
+			if shouldSpin && uint64(nanotime()-start) < spinloopDuration {
+				spinStart := nanotime()
+				procyield(spinloopCycles)
+				t.perf.observeSpin(time.Duration(nanotime() - spinStart))
+				continue
 			}
-			procyield(1)
-			continue
+			t.waitReadEvent()
+			goto retry
 		case windows.ERROR_HANDLE_EOF:
 			t.running.Done()
+			t.perf.observeRead(time.Duration(nanotime()-start), 0, os.ErrClosed)
 			return nil, nil, os.ErrClosed
 		case windows.ERROR_INVALID_DATA:
 			t.running.Done()
-			return nil, nil, errors.New("send ring corrupt")
+			err = errors.New("send ring corrupt")
+			t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
+			return nil, nil, err
 		}
 		t.running.Done()
+		t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
 		return nil, nil, fmt.Errorf("read failed: %w", err)
+	}
+}
+
+func (t *NativeTun) TryReadPacket() ([]byte, func(), bool, error) {
+	t.running.Add(1)
+	if t.close.Load() == 1 {
+		t.running.Done()
+		return nil, nil, false, os.ErrClosed
+	}
+	start := nanotime()
+	packet, err := t.session.ReceivePacket()
+	switch err {
+	case nil:
+		packetSize := len(packet)
+		t.rate.update(uint64(packetSize))
+		t.perf.observeRead(time.Duration(nanotime()-start), packetSize, nil)
+		return packet, func() {
+			t.session.ReleaseReceivePacket(packet)
+			t.running.Done()
+		}, true, nil
+	case windows.ERROR_NO_MORE_ITEMS:
+		t.running.Done()
+		return nil, nil, false, nil
+	case windows.ERROR_HANDLE_EOF:
+		t.running.Done()
+		t.perf.observeRead(time.Duration(nanotime()-start), 0, os.ErrClosed)
+		return nil, nil, false, os.ErrClosed
+	case windows.ERROR_INVALID_DATA:
+		t.running.Done()
+		err = errors.New("send ring corrupt")
+		t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
+		return nil, nil, false, err
+	default:
+		t.running.Done()
+		t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
+		return nil, nil, false, fmt.Errorf("read failed: %w", err)
 	}
 }
 
@@ -441,7 +504,7 @@ retry:
 		return os.ErrClosed
 	}
 	start := nanotime()
-	shouldSpin := t.rate.current.Load() >= spinloopRateThreshold && uint64(start-t.rate.nextStartTime.Load()) <= rateMeasurementGranularity*2
+	shouldSpin := t.shouldSpin(start)
 	for {
 		if t.close.Load() == 1 {
 			return os.ErrClosed
@@ -453,19 +516,26 @@ retry:
 			block(packet)
 			t.session.ReleaseReceivePacket(packet)
 			t.rate.update(uint64(packetSize))
+			t.perf.observeRead(time.Duration(nanotime()-start), packetSize, nil)
 			return nil
 		case windows.ERROR_NO_MORE_ITEMS:
-			if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {
-				windows.WaitForSingleObject(t.readWait, windows.INFINITE)
-				goto retry
+			if shouldSpin && uint64(nanotime()-start) < spinloopDuration {
+				spinStart := nanotime()
+				procyield(spinloopCycles)
+				t.perf.observeSpin(time.Duration(nanotime() - spinStart))
+				continue
 			}
-			procyield(1)
-			continue
+			t.waitReadEvent()
+			goto retry
 		case windows.ERROR_HANDLE_EOF:
+			t.perf.observeRead(time.Duration(nanotime()-start), 0, os.ErrClosed)
 			return os.ErrClosed
 		case windows.ERROR_INVALID_DATA:
-			return errors.New("send ring corrupt")
+			err = errors.New("send ring corrupt")
+			t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
+			return err
 		}
+		t.perf.observeRead(time.Duration(nanotime()-start), 0, err)
 		return fmt.Errorf("read failed: %w", err)
 	}
 }
@@ -473,51 +543,63 @@ retry:
 func (t *NativeTun) Write(p []byte) (n int, err error) {
 	t.running.Add(1)
 	defer t.running.Done()
+	start := nanotime()
 	if t.close.Load() == 1 {
+		t.perf.observeWrite(time.Duration(nanotime()-start), 0, os.ErrClosed)
 		return 0, os.ErrClosed
 	}
-	t.rate.update(uint64(len(p)))
 	packet, err := t.session.AllocateSendPacket(len(p))
 	copy(packet, p)
 	if err == nil {
+		t.rate.update(uint64(len(p)))
 		t.session.SendPacket(packet)
+		t.perf.observeWrite(time.Duration(nanotime()-start), len(p), nil)
 		return len(p), nil
 	}
 	switch err {
 	case windows.ERROR_HANDLE_EOF:
+		t.perf.observeWrite(time.Duration(nanotime()-start), 0, os.ErrClosed)
 		return 0, os.ErrClosed
 	case windows.ERROR_BUFFER_OVERFLOW:
+		t.perf.observeWriteOverflow()
 		return 0, nil // Dropping when ring is full.
 	}
+	t.perf.observeWrite(time.Duration(nanotime()-start), 0, err)
 	return 0, fmt.Errorf("write failed: %w", err)
 }
 
 func (t *NativeTun) write(packetElementList [][]byte) (n int, err error) {
 	t.running.Add(1)
 	defer t.running.Done()
+	start := nanotime()
 	if t.close.Load() == 1 {
+		t.perf.observeWrite(time.Duration(nanotime()-start), 0, os.ErrClosed)
 		return 0, os.ErrClosed
 	}
 	var packetSize int
 	for _, packetElement := range packetElementList {
 		packetSize += len(packetElement)
 	}
-	t.rate.update(uint64(packetSize))
 	packet, err := t.session.AllocateSendPacket(packetSize)
 	if err == nil {
+		t.rate.update(uint64(packetSize))
 		var index int
 		for _, packetElement := range packetElementList {
 			index += copy(packet[index:], packetElement)
 		}
 		t.session.SendPacket(packet)
+		t.perf.observeWrite(time.Duration(nanotime()-start), packetSize, nil)
 		return
 	}
 	switch err {
 	case windows.ERROR_HANDLE_EOF:
+		t.perf.observeWrite(time.Duration(nanotime()-start), 0, os.ErrClosed)
 		return 0, os.ErrClosed
 	case windows.ERROR_BUFFER_OVERFLOW:
+		t.perf.observeWriteOverflow()
 		return 0, nil // Dropping when ring is full.
 	}
+	t.perf.observeWrite(time.Duration(nanotime()-start), 0, err)
 	return 0, fmt.Errorf("write failed: %w", err)
 }
 
@@ -577,6 +659,7 @@ func (rate *rateJuggler) update(packetLen uint64) {
 
 const (
 	rateMeasurementGranularity = uint64((time.Second / 2) / time.Nanosecond)
-	spinloopRateThreshold      = 800000000 / 8                                   // 800mbps
-	spinloopDuration           = uint64(time.Millisecond / 80 / time.Nanosecond) // ~1gbit/s
+	spinloopRateThreshold      = 450000000 / 8                                  // 450mbps
+	spinloopDuration           = uint64(time.Millisecond / 25 / time.Nanosecond) // 40us
+	spinloopCycles             = 1
 )

@@ -50,6 +50,11 @@ type WinTun interface {
 	ReadPacket() ([]byte, func(), error)
 }
 
+type WinTunBatch interface {
+	WinTun
+	TryReadPacket() ([]byte, func(), bool, error)
+}
+
 type LinuxTUN interface {
 	Tun
 	N.FrontHeadroom
