@@ -93,22 +93,45 @@ func (m *Mixed) tunLoop() {
 }
 
 func (m *Mixed) wintunLoop(winTun WinTun) {
+	batchTun, _ := winTun.(WinTunBatch)
 	for {
-		packet, release, err := winTun.ReadPacket()
+		err := winTun.ReadFunc(func(packet []byte) {
+			if len(packet) < header.IPv4MinimumSize {
+				return
+			}
+			if m.processPacket(packet) {
+				_, werr := winTun.Write(packet)
+				if werr != nil {
+					m.logger.Trace(E.Cause(werr, "write packet"))
+				}
+			}
+		})
 		if err != nil {
 			return
 		}
-		if len(packet) < header.IPv4MinimumSize {
-			release()
+		if batchTun == nil {
 			continue
 		}
-		if m.processPacket(packet) {
-			_, err = winTun.Write(packet)
+		for {
+			packet, release, ok, err := batchTun.TryReadPacket()
 			if err != nil {
-				m.logger.Trace(E.Cause(err, "write packet"))
+				return
 			}
+			if !ok {
+				break
+			}
+			if len(packet) < header.IPv4MinimumSize {
+				release()
+				continue
+			}
+			if m.processPacket(packet) {
+				_, err = winTun.Write(packet)
+				if err != nil {
+					m.logger.Trace(E.Cause(err, "write packet"))
+				}
+			}
+			release()
 		}
-		release()
 	}
 }
 
