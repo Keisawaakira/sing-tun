@@ -3,8 +3,10 @@ package tun
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +23,8 @@ import (
 )
 
 var ErrIncludeAllNetworks = E.New("`system` and `mixed` stack are not available when `includeAllNetworks` is enabled. See https://github.com/SagerNet/sing-tun/issues/25")
+
+const appRSTDebounce = time.Second
 
 type System struct {
 	ctx                  context.Context
@@ -53,6 +57,9 @@ type System struct {
 	frontHeadroom        int
 	txChecksumOffload    bool
 	recvMsgX             bool
+	tcpNatMissMu         sync.Mutex
+	tcpNatMissAt         time.Time
+	tcpNatMissCount      int
 }
 
 type Session struct {
@@ -60,6 +67,180 @@ type Session struct {
 	DestinationAddress netip.Addr
 	SourcePort         uint16
 	DestinationPort    uint16
+}
+
+type tracedTCPConn struct {
+	net.Conn
+	logger       logger.Logger
+	tcpNat       *TCPNat
+	natPort      uint16
+	source       netip.AddrPort
+	destination  netip.AddrPort
+	startedAt    time.Time
+	readErrOnce  sync.Once
+	writeErrOnce sync.Once
+	statusMu     sync.Mutex
+	firstReadAt  time.Duration
+	firstWriteAt time.Duration
+	firstReadOK  bool
+	firstWriteOK bool
+	readErrSeen  bool
+	writeErrSeen bool
+}
+
+func newTracedTCPConn(conn net.Conn, logger logger.Logger, tcpNat *TCPNat, natPort uint16, source netip.AddrPort, destination netip.AddrPort) net.Conn {
+	if destination.Port() != 443 {
+		return conn
+	}
+	return &tracedTCPConn{
+		Conn:        conn,
+		logger:      logger,
+		tcpNat:      tcpNat,
+		natPort:     natPort,
+		source:      source,
+		destination: destination,
+		startedAt:   time.Now(),
+	}
+}
+
+func (c *tracedTCPConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.markFirstRead()
+	}
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !isTemporaryTimeout(err) {
+		c.readErrOnce.Do(func() {
+			c.markReadErr()
+			c.logIO("read", n, err)
+		})
+	}
+	return n, err
+}
+
+func (c *tracedTCPConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.markFirstWrite()
+	}
+	if err != nil && !errors.Is(err, net.ErrClosed) && !isTemporaryTimeout(err) {
+		c.writeErrOnce.Do(func() {
+			c.markWriteErr()
+			c.logIO("write", n, err)
+		})
+	}
+	return n, err
+}
+
+func (c *tracedTCPConn) CloseWrite() error {
+	if writeCloser, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return writeCloser.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *tracedTCPConn) CloseRead() error {
+	if readCloser, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return readCloser.CloseRead()
+	}
+	return c.Conn.Close()
+}
+
+func (c *tracedTCPConn) logIO(stage string, n int, err error) {
+	active, draining := 0, 0
+	state := "unknown"
+	if c.tcpNat != nil {
+		active, draining = c.tcpNat.Stats()
+		state = c.tcpNat.State(c.natPort)
+	}
+	status := c.snapshot()
+	c.logger.Warn(
+		"[TCPLocal] conn-", stage,
+		"-error nat_port=", c.natPort,
+		" duration=", time.Since(c.startedAt),
+		" local=", c.LocalAddr(),
+		" remote=", c.RemoteAddr(),
+		" src=", c.source,
+		" dst=", c.destination,
+		" state=", state,
+		" active=", active,
+		" draining=", draining,
+		" bytes=", n,
+		" first_read_ok=", status.firstReadOK,
+		" first_read_at=", status.firstReadAt,
+		" first_write_ok=", status.firstWriteOK,
+		" first_write_at=", status.firstWriteAt,
+		" err=", err,
+	)
+}
+
+type tracedTCPStatus struct {
+	firstReadAt  time.Duration
+	firstWriteAt time.Duration
+	firstReadOK  bool
+	firstWriteOK bool
+	readErrSeen  bool
+	writeErrSeen bool
+}
+
+func (c *tracedTCPConn) markFirstRead() {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	if c.firstReadOK {
+		return
+	}
+	c.firstReadOK = true
+	c.firstReadAt = time.Since(c.startedAt).Round(time.Millisecond)
+}
+
+func (c *tracedTCPConn) markFirstWrite() {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	if c.firstWriteOK {
+		return
+	}
+	c.firstWriteOK = true
+	c.firstWriteAt = time.Since(c.startedAt).Round(time.Millisecond)
+	if c.tcpNat != nil {
+		c.tcpNat.MarkResponseStarted(c.natPort)
+	}
+}
+
+func (c *tracedTCPConn) markReadErr() {
+	c.statusMu.Lock()
+	c.readErrSeen = true
+	c.statusMu.Unlock()
+}
+
+func (c *tracedTCPConn) markWriteErr() {
+	c.statusMu.Lock()
+	c.writeErrSeen = true
+	c.statusMu.Unlock()
+}
+
+func (c *tracedTCPConn) snapshot() tracedTCPStatus {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	return tracedTCPStatus{
+		firstReadAt:  c.firstReadAt,
+		firstWriteAt: c.firstWriteAt,
+		firstReadOK:  c.firstReadOK,
+		firstWriteOK: c.firstWriteOK,
+		readErrSeen:  c.readErrSeen,
+		writeErrSeen: c.writeErrSeen,
+	}
+}
+
+func tracedTCPConnStatus(conn net.Conn) (tracedTCPStatus, bool) {
+	tc, ok := conn.(*tracedTCPConn)
+	if !ok {
+		return tracedTCPStatus{}, false
+	}
+	return tc.snapshot(), true
+}
+
+func isTemporaryTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func NewSystem(options StackOptions) (Stack, error) {
@@ -367,19 +548,53 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat) {
 		connPort := M.SocksaddrFromNet(conn.RemoteAddr()).Port
 		session := tcpNat.LookupBack(connPort)
 		if session == nil {
-			s.logger.Trace(E.New("unknown session with port ", connPort))
+			s.logTCPNatMiss(tcpNat, "accept", connPort)
+			_ = conn.Close()
 			continue
 		}
-		go func() {
-			_ = s.handler.NewConnection(s.ctx, conn, M.Metadata{
-				Source:      M.SocksaddrFromNetIP(session.Source),
-				Destination: M.SocksaddrFromNetIP(session.Destination),
-			})
-			if tcpConn, isTCPConn := conn.(*net.TCPConn); isTCPConn {
-				_ = tcpConn.SetLinger(0)
+		go func(conn net.Conn, connPort uint16, source netip.AddrPort, destination netip.AddrPort) {
+			conn = newTracedTCPConn(conn, s.logger, tcpNat, connPort, source, destination)
+			startedAt := time.Now()
+			metadata := M.Metadata{
+				Source:      M.SocksaddrFromNetIP(source),
+				Destination: M.SocksaddrFromNetIP(destination),
 			}
+			err := s.handler.NewConnection(s.ctx, conn, metadata)
+			duration := time.Since(startedAt)
+			status, traced := tracedTCPConnStatus(conn)
+			shouldLog := err != nil
+			if traced && destination.Port() == 443 {
+				shouldLog = shouldLog || status.readErrSeen || status.writeErrSeen
+			}
+			if shouldLog {
+				active, draining := 0, 0
+				state := "unknown"
+				if tcpNat != nil {
+					active, draining = tcpNat.Stats()
+					state = tcpNat.State(connPort)
+				}
+				s.logger.Warn(
+					"[TCPLocal] handler return nat_port=", connPort,
+					" duration=", duration,
+					" local=", conn.LocalAddr(),
+					" remote=", conn.RemoteAddr(),
+					" src=", source,
+					" dst=", destination,
+					" state_before_delete=", state,
+					" active=", active,
+					" draining=", draining,
+					" first_read_ok=", status.firstReadOK,
+					" first_read_at=", status.firstReadAt,
+					" first_write_ok=", status.firstWriteOK,
+					" first_write_at=", status.firstWriteAt,
+					" read_err_seen=", status.readErrSeen,
+					" write_err_seen=", status.writeErrSeen,
+					" err=", err,
+				)
+			}
+			tcpNat.DeletePort(connPort)
 			_ = conn.Close()
-		}()
+		}(conn, connPort, session.Source, session.Destination)
 	}
 }
 
@@ -483,9 +698,11 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet4Address && source.Port() == s.tcpPort {
+		s.logTCPReset(s.tcpNat4, "ipv4", "listener", destination.Port(), tcpHdr.Flags(), source, destination, tcpHdr)
 		session := s.tcpNat4.LookupBack(destination.Port())
 		if session == nil {
-			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
+			s.logTCPNatMiss(s.tcpNat4, "ipv4", destination.Port())
+			return false, nil
 		}
 		source = session.Destination
 		destination = session.Source
@@ -500,9 +717,31 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			natPort, err := s.tcpNat4.Lookup(source, destination)
-			if err != nil {
-				return false, s.resetIPv4TCP(ipHdr, tcpHdr)
+			var natPort uint16
+			if tcpHdr.Flags().Contains(header.TCPFlagRst) {
+				var loaded bool
+				natPort, _, loaded = s.tcpNat4.Find(source, destination)
+				if !loaded {
+					return false, nil
+				}
+				if suppress, responseStartedAt, ignoreUntil, responseStarted, state := s.tcpNat4.ShouldSuppressAppRST(natPort, appRSTDebounce); suppress {
+					s.logger.Warn(
+						"[TCPLocal] suppress app-rst family=ipv4 nat_port=", natPort,
+						" state=", state,
+						" response_started=", responseStarted,
+						" response_started_at=", responseStartedAt,
+						" ignore_until=", ignoreUntil,
+						" src=", source,
+						" dst=", destination,
+					)
+					return false, nil
+				}
+			} else {
+				var err error
+				natPort, err = s.tcpNat4.Lookup(source, destination)
+				if err != nil {
+					return false, s.resetIPv4TCP(ipHdr, tcpHdr)
+				}
 			}
 			source = netip.AddrPortFrom(s.inet4NextAddress, natPort)
 			destination = netip.AddrPortFrom(s.inet4Address, s.tcpPort)
@@ -566,9 +805,11 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet6Address && source.Port() == s.tcpPort6 {
+		s.logTCPReset(s.tcpNat6, "ipv6", "listener", destination.Port(), tcpHdr.Flags(), source, destination, tcpHdr)
 		session := s.tcpNat6.LookupBack(destination.Port())
 		if session == nil {
-			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
+			s.logTCPNatMiss(s.tcpNat6, "ipv6", destination.Port())
+			return false, nil
 		}
 		source = session.Destination
 		destination = session.Source
@@ -583,9 +824,31 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			natPort, err := s.tcpNat6.Lookup(source, destination)
-			if err != nil {
-				return false, s.resetIPv6TCP(ipHdr, tcpHdr)
+			var natPort uint16
+			if tcpHdr.Flags().Contains(header.TCPFlagRst) {
+				var loaded bool
+				natPort, _, loaded = s.tcpNat6.Find(source, destination)
+				if !loaded {
+					return false, nil
+				}
+				if suppress, responseStartedAt, ignoreUntil, responseStarted, state := s.tcpNat6.ShouldSuppressAppRST(natPort, appRSTDebounce); suppress {
+					s.logger.Warn(
+						"[TCPLocal] suppress app-rst family=ipv6 nat_port=", natPort,
+						" state=", state,
+						" response_started=", responseStarted,
+						" response_started_at=", responseStartedAt,
+						" ignore_until=", ignoreUntil,
+						" src=", source,
+						" dst=", destination,
+					)
+					return false, nil
+				}
+			} else {
+				var err error
+				natPort, err = s.tcpNat6.Lookup(source, destination)
+				if err != nil {
+					return false, s.resetIPv6TCP(ipHdr, tcpHdr)
+				}
 			}
 			source = netip.AddrPortFrom(s.inet6NextAddress, natPort)
 			destination = netip.AddrPortFrom(s.inet6Address, s.tcpPort6)
@@ -593,6 +856,69 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	}
 	s.rewriteIPv6TCPPacket(ipHdr, tcpHdr, source, destination)
 	return true, nil
+}
+
+func (s *System) logTCPNatMiss(tcpNat *TCPNat, family string, natPort uint16) {
+	now := time.Now()
+	s.tcpNatMissMu.Lock()
+	s.tcpNatMissCount++
+	if !s.tcpNatMissAt.IsZero() && now.Sub(s.tcpNatMissAt) < 5*time.Second {
+		s.tcpNatMissMu.Unlock()
+		return
+	}
+	missCount := s.tcpNatMissCount
+	s.tcpNatMissCount = 0
+	s.tcpNatMissAt = now
+	s.tcpNatMissMu.Unlock()
+
+	active, draining := 0, 0
+	state := "unknown"
+	if tcpNat != nil {
+		active, draining = tcpNat.Stats()
+		state = tcpNat.State(natPort)
+	}
+
+	s.logger.Warn(
+		"[TCPNat] session missing family=", family,
+		" nat_port=", natPort,
+		" state=", state,
+		" active=", active,
+		" draining=", draining,
+		" recent_misses=", missCount,
+	)
+}
+
+func (s *System) logTCPReset(tcpNat *TCPNat, family string, stage string, natPort uint16, flags header.TCPFlags, source netip.AddrPort, destination netip.AddrPort, tcpHdr header.TCP) {
+	if !flags.Contains(header.TCPFlagRst) {
+		return
+	}
+
+	active, draining := 0, 0
+	state := "unknown"
+	if tcpNat != nil {
+		active, draining = tcpNat.Stats()
+		state = tcpNat.State(natPort)
+	}
+	if stage == "listener" && state != "active" {
+		return
+	}
+	if stage == "app" {
+		return
+	}
+
+	s.logger.Warn(
+		"[TCPLocal] rst family=", family,
+		" stage=", stage,
+		" nat_port=", natPort,
+		" state=", state,
+		" active=", active,
+		" draining=", draining,
+		" flags=", flags,
+		" seq=", tcpHdr.SequenceNumber(),
+		" ack=", tcpHdr.AckNumber(),
+		" src=", source,
+		" dst=", destination,
+	)
 }
 
 func (s *System) resetIPv6TCP(origIPHdr header.IPv6, origTCPHdr header.TCP) error {
