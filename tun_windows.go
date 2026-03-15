@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,7 +36,9 @@ type NativeTun struct {
 	running     sync.WaitGroup
 	closeOnce   sync.Once
 	close       atomic.Int32
-	fwpmSession uintptr
+	fwpmSession    uintptr
+	fwpmSubLayer   windows.GUID
+	fwpmPermitApps map[string]struct{}
 }
 
 func New(options Options) (WinTun, error) {
@@ -184,178 +187,249 @@ func (t *NativeTun) configure() error {
 		}
 	}
 
-	if t.options.AutoRoute && t.options.StrictRoute {
-		var engine uintptr
-		session := &winsys.FWPM_SESSION0{Flags: winsys.FWPM_SESSION_FLAG_DYNAMIC}
-		err := winsys.FwpmEngineOpen0(nil, winsys.RPC_C_AUTHN_DEFAULT, nil, session, unsafe.Pointer(&engine))
-		if err != nil {
-			return os.NewSyscallError("FwpmEngineOpen0", err)
+	if t.options.AutoRoute && (t.options.StrictRoute || len(t.options.ExcludeProcess) > 0 || len(t.options.ExcludeProcessPath) > 0) {
+		if err := t.configureAutoRouteFilters(); err != nil {
+			return err
 		}
-		t.fwpmSession = engine
+	}
 
-		subLayerKey, err := windows.GenerateGUID()
-		if err != nil {
-			return os.NewSyscallError("CoCreateGuid", err)
-		}
+	return nil
+}
 
-		subLayer := winsys.FWPM_SUBLAYER0{}
-		subLayer.SubLayerKey = subLayerKey
-		subLayer.DisplayData = winsys.CreateDisplayData(TunnelType, "auto-route rules")
-		subLayer.Weight = math.MaxUint16
-		err = winsys.FwpmSubLayerAdd0(engine, &subLayer, 0)
-		if err != nil {
-			return os.NewSyscallError("FwpmSubLayerAdd0", err)
-		}
 
+func (t *NativeTun) configureAutoRouteFilters() error {
+	if err := t.ensureWFPMSession(); err != nil {
+		return err
+	}
+
+	if t.options.StrictRoute {
 		processAppID, err := winsys.GetCurrentProcessAppID()
 		if err != nil {
 			return err
 		}
 		defer winsys.FwpmFreeMemory0(unsafe.Pointer(&processAppID))
 
-		var filterId uint64
-		permitCondition := make([]winsys.FWPM_FILTER_CONDITION0, 1)
-		permitCondition[0].FieldKey = winsys.FWPM_CONDITION_ALE_APP_ID
-		permitCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
-		permitCondition[0].ConditionValue.Type = winsys.FWP_BYTE_BLOB_TYPE
-		permitCondition[0].ConditionValue.Value = uintptr(unsafe.Pointer(processAppID))
-
-		permitFilter4 := winsys.FWPM_FILTER0{}
-		permitFilter4.FilterCondition = &permitCondition[0]
-		permitFilter4.NumFilterConditions = 1
-		permitFilter4.DisplayData = winsys.CreateDisplayData(TunnelType, "protect ipv4")
-		permitFilter4.SubLayerKey = subLayerKey
-		permitFilter4.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V4
-		permitFilter4.Action.Type = winsys.FWP_ACTION_PERMIT
-		permitFilter4.Weight.Type = winsys.FWP_UINT8
-		permitFilter4.Weight.Value = uintptr(13)
-		permitFilter4.Flags = winsys.FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
-		err = winsys.FwpmFilterAdd0(engine, &permitFilter4, 0, &filterId)
-		if err != nil {
-			return os.NewSyscallError("FwpmFilterAdd0", err)
-		}
-
-		permitFilter6 := winsys.FWPM_FILTER0{}
-		permitFilter6.FilterCondition = &permitCondition[0]
-		permitFilter6.NumFilterConditions = 1
-		permitFilter6.DisplayData = winsys.CreateDisplayData(TunnelType, "protect ipv6")
-		permitFilter6.SubLayerKey = subLayerKey
-		permitFilter6.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
-		permitFilter6.Action.Type = winsys.FWP_ACTION_PERMIT
-		permitFilter6.Weight.Type = winsys.FWP_UINT8
-		permitFilter6.Weight.Value = uintptr(13)
-		permitFilter6.Flags = winsys.FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
-		err = winsys.FwpmFilterAdd0(engine, &permitFilter6, 0, &filterId)
-		if err != nil {
-			return os.NewSyscallError("FwpmFilterAdd0", err)
-		}
-
-		/*if len(t.options.Inet4Address) == 0 {
-			blockFilter := winsys.FWPM_FILTER0{}
-			blockFilter.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv4")
-			blockFilter.SubLayerKey = subLayerKey
-			blockFilter.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V4
-			blockFilter.Action.Type = winsys.FWP_ACTION_BLOCK
-			blockFilter.Weight.Type = winsys.FWP_UINT8
-			blockFilter.Weight.Value = uintptr(12)
-			err = winsys.FwpmFilterAdd0(engine, &blockFilter, 0, &filterId)
-			if err != nil {
-				return os.NewSyscallError("FwpmFilterAdd0", err)
-			}
-		}*/
-
-		if len(t.options.Inet6Address) == 0 {
-			blockFilter := winsys.FWPM_FILTER0{}
-			blockFilter.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv6")
-			blockFilter.SubLayerKey = subLayerKey
-			blockFilter.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
-			blockFilter.Action.Type = winsys.FWP_ACTION_BLOCK
-			blockFilter.Weight.Type = winsys.FWP_UINT8
-			blockFilter.Weight.Value = uintptr(12)
-			err = winsys.FwpmFilterAdd0(engine, &blockFilter, 0, &filterId)
-			if err != nil {
-				return os.NewSyscallError("FwpmFilterAdd0", err)
-			}
-		}
-
-		netInterface, err := net.InterfaceByName(t.options.Name)
-		if err != nil {
+		if err := t.addPermitFilterForAppID(processAppID, "protect", 13); err != nil {
 			return err
 		}
-
-		tunCondition := make([]winsys.FWPM_FILTER_CONDITION0, 1)
-		tunCondition[0].FieldKey = winsys.FWPM_CONDITION_LOCAL_INTERFACE_INDEX
-		tunCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
-		tunCondition[0].ConditionValue.Type = winsys.FWP_UINT32
-		tunCondition[0].ConditionValue.Value = uintptr(uint32(netInterface.Index))
-
-		if len(t.options.Inet4Address) > 0 {
-			tunFilter4 := winsys.FWPM_FILTER0{}
-			tunFilter4.FilterCondition = &tunCondition[0]
-			tunFilter4.NumFilterConditions = 1
-			tunFilter4.DisplayData = winsys.CreateDisplayData(TunnelType, "allow ipv4")
-			tunFilter4.SubLayerKey = subLayerKey
-			tunFilter4.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V4
-			tunFilter4.Action.Type = winsys.FWP_ACTION_PERMIT
-			tunFilter4.Weight.Type = winsys.FWP_UINT8
-			tunFilter4.Weight.Value = uintptr(11)
-			err = winsys.FwpmFilterAdd0(engine, &tunFilter4, 0, &filterId)
-			if err != nil {
-				return os.NewSyscallError("FwpmFilterAdd0", err)
+		if len(t.options.Inet6Address) == 0 {
+			if err := t.addBlockIPv6Filter(); err != nil {
+				return err
 			}
 		}
-
-		if len(t.options.Inet6Address) > 0 {
-			tunFilter6 := winsys.FWPM_FILTER0{}
-			tunFilter6.FilterCondition = &tunCondition[0]
-			tunFilter6.NumFilterConditions = 1
-			tunFilter6.DisplayData = winsys.CreateDisplayData(TunnelType, "allow ipv6")
-			tunFilter6.SubLayerKey = subLayerKey
-			tunFilter6.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
-			tunFilter6.Action.Type = winsys.FWP_ACTION_PERMIT
-			tunFilter6.Weight.Type = winsys.FWP_UINT8
-			tunFilter6.Weight.Value = uintptr(11)
-			err = winsys.FwpmFilterAdd0(engine, &tunFilter6, 0, &filterId)
-			if err != nil {
-				return os.NewSyscallError("FwpmFilterAdd0", err)
-			}
+		if err := t.addInterfacePermitFilters(); err != nil {
+			return err
 		}
-
 		if !t.options.EXP_DisableDNSHijack {
-			blockDNSCondition := make([]winsys.FWPM_FILTER_CONDITION0, 1)
-			blockDNSCondition[0].FieldKey = winsys.FWPM_CONDITION_IP_REMOTE_PORT
-			blockDNSCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
-			blockDNSCondition[0].ConditionValue.Type = winsys.FWP_UINT16
-			blockDNSCondition[0].ConditionValue.Value = uintptr(uint16(53))
-
-			blockDNSFilter4 := winsys.FWPM_FILTER0{}
-			blockDNSFilter4.FilterCondition = &blockDNSCondition[0]
-			blockDNSFilter4.NumFilterConditions = 1
-			blockDNSFilter4.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv4 dns")
-			blockDNSFilter4.SubLayerKey = subLayerKey
-			blockDNSFilter4.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V4
-			blockDNSFilter4.Action.Type = winsys.FWP_ACTION_BLOCK
-			blockDNSFilter4.Weight.Type = winsys.FWP_UINT8
-			blockDNSFilter4.Weight.Value = uintptr(10)
-			err = winsys.FwpmFilterAdd0(engine, &blockDNSFilter4, 0, &filterId)
-			if err != nil {
-				return os.NewSyscallError("FwpmFilterAdd0", err)
-			}
-
-			blockDNSFilter6 := winsys.FWPM_FILTER0{}
-			blockDNSFilter6.FilterCondition = &blockDNSCondition[0]
-			blockDNSFilter6.NumFilterConditions = 1
-			blockDNSFilter6.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv6 dns")
-			blockDNSFilter6.SubLayerKey = subLayerKey
-			blockDNSFilter6.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
-			blockDNSFilter6.Action.Type = winsys.FWP_ACTION_BLOCK
-			blockDNSFilter6.Weight.Type = winsys.FWP_UINT8
-			blockDNSFilter6.Weight.Value = uintptr(10)
-			err = winsys.FwpmFilterAdd0(engine, &blockDNSFilter6, 0, &filterId)
-			if err != nil {
-				return os.NewSyscallError("FwpmFilterAdd0", err)
+			if err := t.addBlockDNSFilters(); err != nil {
+				return err
 			}
 		}
+	}
+
+	resolvedPaths, unresolvedNames, err := resolveExcludedProcessPaths(t.options.ExcludeProcess, t.options.ExcludeProcessPath)
+	if err != nil {
+		return err
+	}
+	for _, path := range resolvedPaths {
+		if err := t.addPermitFilterForPath(path); err != nil {
+			return err
+		}
+	}
+	if t.options.Logger != nil && len(unresolvedNames) > 0 {
+		t.options.Logger.Warn("tun exclude-process unresolved names: ", strings.Join(unresolvedNames, ", "))
+	}
+	return nil
+}
+
+func (t *NativeTun) ensureWFPMSession() error {
+	if t.fwpmSession != 0 {
+		return nil
+	}
+
+	var engine uintptr
+	session := &winsys.FWPM_SESSION0{Flags: winsys.FWPM_SESSION_FLAG_DYNAMIC}
+	err := winsys.FwpmEngineOpen0(nil, winsys.RPC_C_AUTHN_DEFAULT, nil, session, unsafe.Pointer(&engine))
+	if err != nil {
+		return os.NewSyscallError("FwpmEngineOpen0", err)
+	}
+
+	subLayerKey, err := windows.GenerateGUID()
+	if err != nil {
+		winsys.FwpmEngineClose0(engine)
+		return os.NewSyscallError("CoCreateGuid", err)
+	}
+
+	subLayer := winsys.FWPM_SUBLAYER0{}
+	subLayer.SubLayerKey = subLayerKey
+	subLayer.DisplayData = winsys.CreateDisplayData(TunnelType, "auto-route rules")
+	subLayer.Weight = math.MaxUint16
+	err = winsys.FwpmSubLayerAdd0(engine, &subLayer, 0)
+	if err != nil {
+		winsys.FwpmEngineClose0(engine)
+		return os.NewSyscallError("FwpmSubLayerAdd0", err)
+	}
+
+	t.fwpmSession = engine
+	t.fwpmSubLayer = subLayerKey
+	if t.fwpmPermitApps == nil {
+		t.fwpmPermitApps = make(map[string]struct{})
+	}
+	return nil
+}
+
+func (t *NativeTun) addPermitFilterForAppID(appID *winsys.FWP_BYTE_BLOB, description string, weight uint8) error {
+	var filterID uint64
+	permitCondition := []winsys.FWPM_FILTER_CONDITION0{{}}
+	permitCondition[0].FieldKey = winsys.FWPM_CONDITION_ALE_APP_ID
+	permitCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
+	permitCondition[0].ConditionValue.Type = winsys.FWP_BYTE_BLOB_TYPE
+	permitCondition[0].ConditionValue.Value = uintptr(unsafe.Pointer(appID))
+
+	permitFilter4 := winsys.FWPM_FILTER0{}
+	permitFilter4.FilterCondition = &permitCondition[0]
+	permitFilter4.NumFilterConditions = 1
+	permitFilter4.DisplayData = winsys.CreateDisplayData(TunnelType, description+" ipv4")
+	permitFilter4.SubLayerKey = t.fwpmSubLayer
+	permitFilter4.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V4
+	permitFilter4.Action.Type = winsys.FWP_ACTION_PERMIT
+	permitFilter4.Weight.Type = winsys.FWP_UINT8
+	permitFilter4.Weight.Value = uintptr(weight)
+	permitFilter4.Flags = winsys.FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
+	if err := winsys.FwpmFilterAdd0(t.fwpmSession, &permitFilter4, 0, &filterID); err != nil {
+		return os.NewSyscallError("FwpmFilterAdd0", err)
+	}
+
+	permitFilter6 := winsys.FWPM_FILTER0{}
+	permitFilter6.FilterCondition = &permitCondition[0]
+	permitFilter6.NumFilterConditions = 1
+	permitFilter6.DisplayData = winsys.CreateDisplayData(TunnelType, description+" ipv6")
+	permitFilter6.SubLayerKey = t.fwpmSubLayer
+	permitFilter6.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
+	permitFilter6.Action.Type = winsys.FWP_ACTION_PERMIT
+	permitFilter6.Weight.Type = winsys.FWP_UINT8
+	permitFilter6.Weight.Value = uintptr(weight)
+	permitFilter6.Flags = winsys.FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
+	if err := winsys.FwpmFilterAdd0(t.fwpmSession, &permitFilter6, 0, &filterID); err != nil {
+		return os.NewSyscallError("FwpmFilterAdd0", err)
+	}
+
+	return nil
+}
+
+func (t *NativeTun) addPermitFilterForPath(path string) error {
+	normalizedPath := normalizeProcessPath(path)
+	if normalizedPath == "" {
+		return nil
+	}
+	if _, exists := t.fwpmPermitApps[normalizedPath]; exists {
+		return nil
+	}
+	appID, err := winsys.GetAppIDByPath(normalizedPath)
+	if err != nil {
+		return err
+	}
+	defer winsys.FwpmFreeMemory0(unsafe.Pointer(&appID))
+	if err := t.addPermitFilterForAppID(appID, processFilterDescription(normalizedPath), 14); err != nil {
+		return err
+	}
+	t.fwpmPermitApps[normalizedPath] = struct{}{}
+	return nil
+}
+
+func (t *NativeTun) addBlockIPv6Filter() error {
+	var filterID uint64
+	blockFilter := winsys.FWPM_FILTER0{}
+	blockFilter.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv6")
+	blockFilter.SubLayerKey = t.fwpmSubLayer
+	blockFilter.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
+	blockFilter.Action.Type = winsys.FWP_ACTION_BLOCK
+	blockFilter.Weight.Type = winsys.FWP_UINT8
+	blockFilter.Weight.Value = uintptr(12)
+	if err := winsys.FwpmFilterAdd0(t.fwpmSession, &blockFilter, 0, &filterID); err != nil {
+		return os.NewSyscallError("FwpmFilterAdd0", err)
+	}
+	return nil
+}
+
+func (t *NativeTun) addInterfacePermitFilters() error {
+	netInterface, err := net.InterfaceByName(t.options.Name)
+	if err != nil {
+		return err
+	}
+
+	var filterID uint64
+	tunCondition := []winsys.FWPM_FILTER_CONDITION0{{}}
+	tunCondition[0].FieldKey = winsys.FWPM_CONDITION_LOCAL_INTERFACE_INDEX
+	tunCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
+	tunCondition[0].ConditionValue.Type = winsys.FWP_UINT32
+	tunCondition[0].ConditionValue.Value = uintptr(uint32(netInterface.Index))
+
+	if len(t.options.Inet4Address) > 0 {
+		tunFilter4 := winsys.FWPM_FILTER0{}
+		tunFilter4.FilterCondition = &tunCondition[0]
+		tunFilter4.NumFilterConditions = 1
+		tunFilter4.DisplayData = winsys.CreateDisplayData(TunnelType, "allow ipv4")
+		tunFilter4.SubLayerKey = t.fwpmSubLayer
+		tunFilter4.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V4
+		tunFilter4.Action.Type = winsys.FWP_ACTION_PERMIT
+		tunFilter4.Weight.Type = winsys.FWP_UINT8
+		tunFilter4.Weight.Value = uintptr(11)
+		if err := winsys.FwpmFilterAdd0(t.fwpmSession, &tunFilter4, 0, &filterID); err != nil {
+			return os.NewSyscallError("FwpmFilterAdd0", err)
+		}
+	}
+
+	if len(t.options.Inet6Address) > 0 {
+		tunFilter6 := winsys.FWPM_FILTER0{}
+		tunFilter6.FilterCondition = &tunCondition[0]
+		tunFilter6.NumFilterConditions = 1
+		tunFilter6.DisplayData = winsys.CreateDisplayData(TunnelType, "allow ipv6")
+		tunFilter6.SubLayerKey = t.fwpmSubLayer
+		tunFilter6.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
+		tunFilter6.Action.Type = winsys.FWP_ACTION_PERMIT
+		tunFilter6.Weight.Type = winsys.FWP_UINT8
+		tunFilter6.Weight.Value = uintptr(11)
+		if err := winsys.FwpmFilterAdd0(t.fwpmSession, &tunFilter6, 0, &filterID); err != nil {
+			return os.NewSyscallError("FwpmFilterAdd0", err)
+		}
+	}
+
+	return nil
+}
+
+func (t *NativeTun) addBlockDNSFilters() error {
+	var filterID uint64
+	blockDNSCondition := []winsys.FWPM_FILTER_CONDITION0{{}}
+	blockDNSCondition[0].FieldKey = winsys.FWPM_CONDITION_IP_REMOTE_PORT
+	blockDNSCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
+	blockDNSCondition[0].ConditionValue.Type = winsys.FWP_UINT16
+	blockDNSCondition[0].ConditionValue.Value = uintptr(uint16(53))
+
+	blockDNSFilter4 := winsys.FWPM_FILTER0{}
+	blockDNSFilter4.FilterCondition = &blockDNSCondition[0]
+	blockDNSFilter4.NumFilterConditions = 1
+	blockDNSFilter4.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv4 dns")
+	blockDNSFilter4.SubLayerKey = t.fwpmSubLayer
+	blockDNSFilter4.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V4
+	blockDNSFilter4.Action.Type = winsys.FWP_ACTION_BLOCK
+	blockDNSFilter4.Weight.Type = winsys.FWP_UINT8
+	blockDNSFilter4.Weight.Value = uintptr(10)
+	if err := winsys.FwpmFilterAdd0(t.fwpmSession, &blockDNSFilter4, 0, &filterID); err != nil {
+		return os.NewSyscallError("FwpmFilterAdd0", err)
+	}
+
+	blockDNSFilter6 := winsys.FWPM_FILTER0{}
+	blockDNSFilter6.FilterCondition = &blockDNSCondition[0]
+	blockDNSFilter6.NumFilterConditions = 1
+	blockDNSFilter6.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv6 dns")
+	blockDNSFilter6.SubLayerKey = t.fwpmSubLayer
+	blockDNSFilter6.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
+	blockDNSFilter6.Action.Type = winsys.FWP_ACTION_BLOCK
+	blockDNSFilter6.Weight.Type = winsys.FWP_UINT8
+	blockDNSFilter6.Weight.Value = uintptr(10)
+	if err := winsys.FwpmFilterAdd0(t.fwpmSession, &blockDNSFilter6, 0, &filterID); err != nil {
+		return os.NewSyscallError("FwpmFilterAdd0", err)
 	}
 
 	return nil

@@ -24,23 +24,24 @@ func CreateDisplayData(name, description string) FWPM_DISPLAY_DATA0 {
 	}
 }
 
+func GetAppIDByPath(path string) (*FWP_BYTE_BLOB, error) {
+	pathPtr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var appID *FWP_BYTE_BLOB
+	err = FwpmGetAppIdFromFileName0(pathPtr, unsafe.Pointer(&appID))
+	if err != nil {
+		return nil, err
+	}
+	return appID, nil
+}
+
 func GetCurrentProcessAppID() (*FWP_BYTE_BLOB, error) {
 	currentFile, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
-
-	curFilePtr, err := windows.UTF16PtrFromString(currentFile)
-	if err != nil {
-		return nil, err
-	}
-
-	windows.GetCurrentProcessId()
-
-	var appID *FWP_BYTE_BLOB
-	err = FwpmGetAppIdFromFileName0(curFilePtr, unsafe.Pointer(&appID))
-	if err != nil {
-		return nil, err
-	}
-	return appID, nil
+	return GetAppIDByPath(currentFile)
 }
