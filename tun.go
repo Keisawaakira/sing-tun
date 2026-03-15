@@ -103,6 +103,8 @@ type Options struct {
 	Inet6RouteExcludeAddress              []netip.Prefix
 	IncludeInterface                      []string
 	ExcludeInterface                      []string
+	ExcludeProcess                        []string
+	ExcludeProcessPath                    []string
 	IncludeUID                            []ranges.Range[uint32]
 	ExcludeUID                            []ranges.Range[uint32]
 	ExcludeSrcPort                        []ranges.Range[uint16]
