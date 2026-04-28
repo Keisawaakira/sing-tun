@@ -3,10 +3,11 @@ package tun
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,7 +25,10 @@ import (
 
 var ErrIncludeAllNetworks = E.New("`system` and `mixed` stack are not available when `includeAllNetworks` is enabled. See https://github.com/SagerNet/sing-tun/issues/25")
 
-const appRSTDebounce = time.Second
+const (
+	appRSTSuppressWindow        = time.Second
+	appRSTDeferredCloseMinDelay = 500 * time.Millisecond
+)
 
 type System struct {
 	ctx                  context.Context
@@ -56,9 +60,6 @@ type System struct {
 	frontHeadroom        int
 	txChecksumOffload    bool
 	recvMsgX             bool
-	tcpNatMissMu         sync.Mutex
-	tcpNatMissAt         time.Time
-	tcpNatMissCount      int
 }
 
 type Session struct {
@@ -68,179 +69,123 @@ type Session struct {
 	DestinationPort    uint16
 }
 
-
-type tracedTCPConn struct {
+type responseTrackingTCPConn struct {
 	net.Conn
-	logger       logger.Logger
 	tcpNat       *TCPNat
 	natPort      uint16
-	source       netip.AddrPort
-	destination  netip.AddrPort
 	startedAt    time.Time
-	readErrOnce  sync.Once
-	writeErrOnce sync.Once
-	statusMu     sync.Mutex
-	firstReadAt  time.Duration
-	firstWriteAt time.Duration
-	firstReadOK  bool
-	firstWriteOK bool
-	readErrSeen  bool
-	writeErrSeen bool
+	localAddr    string
+	remoteAddr   string
+	readBytes    int64
+	writeBytes   int64
+	lastReadNano int64
+	lastWriteNano int64
+	errMu        sync.Mutex
+	lastReadErr  string
+	lastWriteErr string
 }
 
-func newTracedTCPConn(conn net.Conn, logger logger.Logger, tcpNat *TCPNat, natPort uint16, source netip.AddrPort, destination netip.AddrPort) net.Conn {
-	if destination.Port() != 443 {
-		return conn
-	}
-	return &tracedTCPConn{
-		Conn:        conn,
-		logger:      logger,
-		tcpNat:      tcpNat,
-		natPort:     natPort,
-		source:      source,
-		destination: destination,
-		startedAt:   time.Now(),
+type responseTrackingSnapshot struct {
+	startedAt    time.Time
+	duration     time.Duration
+	localAddr    string
+	remoteAddr   string
+	readBytes    int64
+	writeBytes   int64
+	lastReadAt   time.Time
+	lastWriteAt  time.Time
+	lastReadErr  string
+	lastWriteErr string
+}
+
+func newResponseTrackingTCPConn(conn net.Conn, tcpNat *TCPNat, natPort uint16) *responseTrackingTCPConn {
+	return &responseTrackingTCPConn{
+		Conn:      conn,
+		tcpNat:    tcpNat,
+		natPort:   natPort,
+		startedAt: time.Now(),
+		localAddr:  tcpBridgeAddrString(conn.LocalAddr()),
+		remoteAddr: tcpBridgeAddrString(conn.RemoteAddr()),
 	}
 }
 
-func (c *tracedTCPConn) Read(p []byte) (int, error) {
+func (c *responseTrackingTCPConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		c.markFirstRead()
+		atomic.AddInt64(&c.readBytes, int64(n))
+		atomic.StoreInt64(&c.lastReadNano, time.Now().UnixNano())
 	}
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !isTemporaryTimeout(err) {
-		c.readErrOnce.Do(func() {
-			c.markReadErr()
-			c.logIO("read", n, err)
-		})
+	if err != nil {
+		c.setLastReadErr(err)
 	}
 	return n, err
 }
 
-func (c *tracedTCPConn) Write(p []byte) (int, error) {
+func (c *responseTrackingTCPConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if n > 0 {
-		c.markFirstWrite()
+		atomic.AddInt64(&c.writeBytes, int64(n))
+		atomic.StoreInt64(&c.lastWriteNano, time.Now().UnixNano())
+		c.markResponseStarted()
 	}
-	if err != nil && !errors.Is(err, net.ErrClosed) && !isTemporaryTimeout(err) {
-		c.writeErrOnce.Do(func() {
-			c.markWriteErr()
-			c.logIO("write", n, err)
-		})
+	if err != nil {
+		c.setLastWriteErr(err)
 	}
 	return n, err
 }
 
-func (c *tracedTCPConn) CloseWrite() error {
+func (c *responseTrackingTCPConn) CloseWrite() error {
 	if writeCloser, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return writeCloser.CloseWrite()
 	}
 	return c.Conn.Close()
 }
 
-func (c *tracedTCPConn) CloseRead() error {
+func (c *responseTrackingTCPConn) CloseRead() error {
 	if readCloser, ok := c.Conn.(interface{ CloseRead() error }); ok {
 		return readCloser.CloseRead()
 	}
 	return c.Conn.Close()
 }
 
-func (c *tracedTCPConn) logIO(stage string, n int, err error) {
-	active, draining := 0, 0
-	state := "unknown"
-	if c.tcpNat != nil {
-		active, draining = c.tcpNat.Stats()
-		state = c.tcpNat.State(c.natPort)
+func (c *responseTrackingTCPConn) Snapshot() responseTrackingSnapshot {
+	lastReadNano := atomic.LoadInt64(&c.lastReadNano)
+	lastWriteNano := atomic.LoadInt64(&c.lastWriteNano)
+	c.errMu.Lock()
+	lastReadErr := c.lastReadErr
+	lastWriteErr := c.lastWriteErr
+	c.errMu.Unlock()
+	return responseTrackingSnapshot{
+		startedAt:    c.startedAt,
+		duration:     time.Since(c.startedAt),
+		localAddr:    c.localAddr,
+		remoteAddr:   c.remoteAddr,
+		readBytes:    atomic.LoadInt64(&c.readBytes),
+		writeBytes:   atomic.LoadInt64(&c.writeBytes),
+		lastReadAt:   tcpBridgeTimeFromUnixNano(lastReadNano),
+		lastWriteAt:  tcpBridgeTimeFromUnixNano(lastWriteNano),
+		lastReadErr:  lastReadErr,
+		lastWriteErr: lastWriteErr,
 	}
-	status := c.snapshot()
-	c.logger.Warn(
-		"[TCPLocal] conn-", stage,
-		"-error nat_port=", c.natPort,
-		" duration=", time.Since(c.startedAt),
-		" local=", c.LocalAddr(),
-		" remote=", c.RemoteAddr(),
-		" src=", c.source,
-		" dst=", c.destination,
-		" state=", state,
-		" active=", active,
-		" draining=", draining,
-		" bytes=", n,
-		" first_read_ok=", status.firstReadOK,
-		" first_read_at=", status.firstReadAt,
-		" first_write_ok=", status.firstWriteOK,
-		" first_write_at=", status.firstWriteAt,
-		" err=", err,
-	)
 }
 
-type tracedTCPStatus struct {
-	firstReadAt  time.Duration
-	firstWriteAt time.Duration
-	firstReadOK  bool
-	firstWriteOK bool
-	readErrSeen  bool
-	writeErrSeen bool
+func (c *responseTrackingTCPConn) setLastReadErr(err error) {
+	c.errMu.Lock()
+	c.lastReadErr = err.Error()
+	c.errMu.Unlock()
 }
 
-func (c *tracedTCPConn) markFirstRead() {
-	c.statusMu.Lock()
-	defer c.statusMu.Unlock()
-	if c.firstReadOK {
+func (c *responseTrackingTCPConn) setLastWriteErr(err error) {
+	c.errMu.Lock()
+	c.lastWriteErr = err.Error()
+	c.errMu.Unlock()
+}
+
+func (c *responseTrackingTCPConn) markResponseStarted() {
+	if c.tcpNat == nil {
 		return
 	}
-	c.firstReadOK = true
-	c.firstReadAt = time.Since(c.startedAt).Round(time.Millisecond)
-}
-
-func (c *tracedTCPConn) markFirstWrite() {
-	c.statusMu.Lock()
-	defer c.statusMu.Unlock()
-	if c.firstWriteOK {
-		return
-	}
-	c.firstWriteOK = true
-	c.firstWriteAt = time.Since(c.startedAt).Round(time.Millisecond)
-	if c.tcpNat != nil {
-		c.tcpNat.MarkResponseStarted(c.natPort)
-	}
-}
-
-func (c *tracedTCPConn) markReadErr() {
-	c.statusMu.Lock()
-	c.readErrSeen = true
-	c.statusMu.Unlock()
-}
-
-func (c *tracedTCPConn) markWriteErr() {
-	c.statusMu.Lock()
-	c.writeErrSeen = true
-	c.statusMu.Unlock()
-}
-
-func (c *tracedTCPConn) snapshot() tracedTCPStatus {
-	c.statusMu.Lock()
-	defer c.statusMu.Unlock()
-	return tracedTCPStatus{
-		firstReadAt:  c.firstReadAt,
-		firstWriteAt: c.firstWriteAt,
-		firstReadOK:  c.firstReadOK,
-		firstWriteOK: c.firstWriteOK,
-		readErrSeen:  c.readErrSeen,
-		writeErrSeen: c.writeErrSeen,
-	}
-}
-
-func tracedTCPConnStatus(conn net.Conn) (tracedTCPStatus, bool) {
-	tc, ok := conn.(*tracedTCPConn)
-	if !ok {
-		return tracedTCPStatus{}, false
-	}
-	return tc.snapshot(), true
-}
-
-func isTemporaryTimeout(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
+	c.tcpNat.MarkResponseStarted(c.natPort)
 }
 
 func NewSystem(options StackOptions) (Stack, error) {
@@ -547,54 +492,129 @@ func (s *System) acceptLoop(listener net.Listener) {
 		connPort := M.SocksaddrFromNet(conn.RemoteAddr()).Port
 		session := s.tcpNat.LookupBack(connPort)
 		if session == nil {
-			s.logTCPNatMiss("accept", connPort)
+			s.logTCPBridgeAcceptMissing(connPort, conn)
 			_ = conn.Close()
 			continue
 		}
 		go func(conn net.Conn, connPort uint16, source netip.AddrPort, destination netip.AddrPort) {
-			conn = newTracedTCPConn(conn, s.logger, s.tcpNat, connPort, source, destination)
-			startedAt := time.Now()
+			trackedConn := newResponseTrackingTCPConn(conn, s.tcpNat, connPort)
 			metadata := M.Metadata{
 				Source:      M.SocksaddrFromNetIP(source),
 				Destination: M.SocksaddrFromNetIP(destination),
 			}
-			err := s.handler.NewConnection(s.ctx, conn, metadata)
-			duration := time.Since(startedAt)
-			status, traced := tracedTCPConnStatus(conn)
-			shouldLog := err != nil
-			if traced && destination.Port() == 443 {
-				shouldLog = shouldLog || status.readErrSeen || status.writeErrSeen
-			}
-			if shouldLog {
-				active, draining := 0, 0
-				state := "unknown"
-				if s.tcpNat != nil {
-					active, draining = s.tcpNat.Stats()
-					state = s.tcpNat.State(connPort)
-				}
-				s.logger.Warn(
-					"[TCPLocal] handler return nat_port=", connPort,
-					" duration=", duration,
-					" local=", conn.LocalAddr(),
-					" remote=", conn.RemoteAddr(),
-					" src=", source,
-					" dst=", destination,
-					" state_before_delete=", state,
-					" active=", active,
-					" draining=", draining,
-					" first_read_ok=", status.firstReadOK,
-					" first_read_at=", status.firstReadAt,
-					" first_write_ok=", status.firstWriteOK,
-					" first_write_at=", status.firstWriteAt,
-					" read_err_seen=", status.readErrSeen,
-					" write_err_seen=", status.writeErrSeen,
-					" err=", err,
-				)
-			}
+			handlerErr := s.handler.NewConnection(s.ctx, trackedConn, metadata)
+			connSnapshot := trackedConn.Snapshot()
+			natSnapshot := s.tcpNat.Snapshot(connPort)
+			s.logTCPBridgeDone(connPort, source, destination, connSnapshot, natSnapshot, handlerErr)
 			s.tcpNat.DeletePort(connPort)
-			_ = conn.Close()
+			_ = trackedConn.Close()
 		}(conn, connPort, session.Source, session.Destination)
 	}
+}
+
+func (s *System) logTCPBridgeAcceptMissing(connPort uint16, conn net.Conn) {
+	active, draining := 0, 0
+	state := "unknown"
+	if s.tcpNat != nil {
+		active, draining = s.tcpNat.Stats()
+		state = s.tcpNat.State(connPort)
+	}
+	s.logger.Warn(
+		"[TCPLocal] bridge-accept-missing nat_port=", connPort,
+		" state=", state,
+		" active=", active,
+		" draining=", draining,
+		" local=", tcpBridgeAddrString(conn.LocalAddr()),
+		" remote=", tcpBridgeAddrString(conn.RemoteAddr()),
+	)
+}
+
+func (s *System) logTCPBridgeDone(natPort uint16, source netip.AddrPort, destination netip.AddrPort, connSnapshot responseTrackingSnapshot, natSnapshot TCPSessionSnapshot, handlerErr error) {
+	if !shouldLogTCPBridgeDone(connSnapshot, handlerErr) {
+		return
+	}
+	active, draining := 0, 0
+	if s.tcpNat != nil {
+		active, draining = s.tcpNat.Stats()
+	}
+	s.logger.Warn(
+		"[TCPLocal] bridge-done nat_port=", natPort,
+		" state=", natSnapshot.State,
+		" duration=", connSnapshot.duration.Round(time.Millisecond),
+		" read_bytes=", connSnapshot.readBytes,
+		" write_bytes=", connSnapshot.writeBytes,
+		" last_read_at=", tcpBridgeTimeString(connSnapshot.lastReadAt),
+		" last_read_since_start=", tcpBridgeSinceStart(connSnapshot.startedAt, connSnapshot.lastReadAt).Round(time.Millisecond),
+		" last_write_at=", tcpBridgeTimeString(connSnapshot.lastWriteAt),
+		" last_write_since_start=", tcpBridgeSinceStart(connSnapshot.startedAt, connSnapshot.lastWriteAt).Round(time.Millisecond),
+		" read_err=", connSnapshot.lastReadErr,
+		" write_err=", connSnapshot.lastWriteErr,
+		" handler_err=", handlerErr,
+		" response_started=", natSnapshot.ResponseStarted,
+		" response_started_at=", natSnapshot.ResponseStartedAt,
+		" last_active=", natSnapshot.LastActive,
+		" age=", natSnapshot.Age.Round(time.Millisecond),
+		" activity_seq=", natSnapshot.ActivitySeq,
+		" app_rst_closed=", natSnapshot.AppRSTClosed,
+		" deferred_app_rst=", natSnapshot.AppRSTDeferredScheduled,
+		" active=", active,
+		" draining=", draining,
+		" src=", source,
+		" dst=", destination,
+		" local=", connSnapshot.localAddr,
+		" remote=", connSnapshot.remoteAddr,
+	)
+}
+
+func shouldLogTCPBridgeDone(connSnapshot responseTrackingSnapshot, handlerErr error) bool {
+	if handlerErr != nil {
+		return true
+	}
+	return tcpBridgeHardError(connSnapshot.lastReadErr) || tcpBridgeHardError(connSnapshot.lastWriteErr)
+}
+
+func tcpBridgeHardError(message string) bool {
+	if message == "" {
+		return false
+	}
+	message = strings.ToLower(message)
+	if message == "eof" || strings.Contains(message, "use of closed network connection") || strings.Contains(message, "closed pipe") {
+		return false
+	}
+	return strings.Contains(message, "connection attempt failed") ||
+		strings.Contains(message, "forcibly closed") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "i/o timeout") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "failed")
+}
+
+func tcpBridgeTimeFromUnixNano(nano int64) time.Time {
+	if nano == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nano)
+}
+
+func tcpBridgeTimeString(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
+func tcpBridgeSinceStart(startedAt time.Time, at time.Time) time.Duration {
+	if startedAt.IsZero() || at.IsZero() {
+		return 0
+	}
+	return at.Sub(startedAt)
+}
+
+func tcpBridgeAddrString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }
 
 func (s *System) processIPv4(ipHdr header.IPv4) (writeBack bool, err error) {
@@ -694,11 +714,9 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet4Address && source.Port() == s.tcpPort {
-		s.logTCPReset("ipv4", "listener", destination.Port(), tcpHdr.Flags(), source, destination, tcpHdr)
 		session := s.tcpNat.LookupBack(destination.Port())
 		if session == nil {
-			s.logTCPNatMiss("ipv4", destination.Port())
-			return false, nil
+			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
 		}
 		source = session.Destination
 		destination = session.Source
@@ -720,18 +738,16 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 				if !loaded {
 					return false, nil
 				}
-				if suppress, responseStartedAt, ignoreUntil, responseStarted, state := s.tcpNat.ShouldSuppressAppRST(natPort, appRSTDebounce); suppress {
-					s.logger.Warn(
-						"[TCPLocal] suppress app-rst family=ipv4 nat_port=", natPort,
-						" state=", state,
-						" response_started=", responseStarted,
-						" response_started_at=", responseStartedAt,
-						" ignore_until=", ignoreUntil,
-						" src=", source,
-						" dst=", destination,
-					)
+				decision := s.tcpNat.ShouldSuppressAppRST(natPort, appRSTSuppressWindow)
+				if decision.ScheduleDeferredClose {
+					s.deferAppRSTClose("ipv4", natPort, source, destination, decision)
+				} else if decision.Log && decision.Suppress {
+					s.logAppRSTDecision("ipv4", natPort, source, destination, decision)
+				}
+				if decision.Suppress {
 					return false, nil
 				}
+				s.tcpNat.CloseByAppRST(natPort)
 			} else {
 				natPort = s.tcpNat.Lookup(source, destination)
 			}
@@ -794,11 +810,9 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet6Address && source.Port() == s.tcpPort6 {
-		s.logTCPReset("ipv6", "listener", destination.Port(), tcpHdr.Flags(), source, destination, tcpHdr)
 		session := s.tcpNat.LookupBack(destination.Port())
 		if session == nil {
-			s.logTCPNatMiss("ipv6", destination.Port())
-			return false, nil
+			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
 		}
 		source = session.Destination
 		destination = session.Source
@@ -820,18 +834,16 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 				if !loaded {
 					return false, nil
 				}
-				if suppress, responseStartedAt, ignoreUntil, responseStarted, state := s.tcpNat.ShouldSuppressAppRST(natPort, appRSTDebounce); suppress {
-					s.logger.Warn(
-						"[TCPLocal] suppress app-rst family=ipv6 nat_port=", natPort,
-						" state=", state,
-						" response_started=", responseStarted,
-						" response_started_at=", responseStartedAt,
-						" ignore_until=", ignoreUntil,
-						" src=", source,
-						" dst=", destination,
-					)
+				decision := s.tcpNat.ShouldSuppressAppRST(natPort, appRSTSuppressWindow)
+				if decision.ScheduleDeferredClose {
+					s.deferAppRSTClose("ipv6", natPort, source, destination, decision)
+				} else if decision.Log && decision.Suppress {
+					s.logAppRSTDecision("ipv6", natPort, source, destination, decision)
+				}
+				if decision.Suppress {
 					return false, nil
 				}
+				s.tcpNat.CloseByAppRST(natPort)
 			} else {
 				natPort = s.tcpNat.Lookup(source, destination)
 			}
@@ -843,64 +855,97 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	return true, nil
 }
 
-func (s *System) logTCPNatMiss(family string, natPort uint16) {
-	now := time.Now()
-	s.tcpNatMissMu.Lock()
-	s.tcpNatMissCount++
-	if !s.tcpNatMissAt.IsZero() && now.Sub(s.tcpNatMissAt) < 5*time.Second {
-		s.tcpNatMissMu.Unlock()
-		return
+func (s *System) deferAppRSTClose(family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, decision AppRSTDecision) {
+	delay := time.Until(decision.SuppressUntil)
+	if delay < appRSTDeferredCloseMinDelay {
+		delay = appRSTDeferredCloseMinDelay
 	}
-	missCount := s.tcpNatMissCount
-	s.tcpNatMissCount = 0
-	s.tcpNatMissAt = now
-	s.tcpNatMissMu.Unlock()
+	s.logDeferredAppRSTSchedule(family, natPort, source, destination, decision, delay)
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			result := s.tcpNat.CloseDeferredAppRST(natPort, decision.ActivitySeq)
+			s.logDeferredAppRSTResult(family, natPort, source, destination, result)
+		case <-s.ctx.Done():
+			return
+		}
+	}()
+}
 
+func (s *System) logDeferredAppRSTSchedule(family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, decision AppRSTDecision, delay time.Duration) {
 	active, draining := 0, 0
-	state := "unknown"
 	if s.tcpNat != nil {
 		active, draining = s.tcpNat.Stats()
-		state = s.tcpNat.State(natPort)
 	}
-
 	s.logger.Warn(
-		"[TCPNat] session missing family=", family,
+		"[TCPLocal] defer app-rst family=", family,
 		" nat_port=", natPort,
-		" state=", state,
+		" state=", decision.State,
+		" reason=", decision.Reason,
+		" response_started=", decision.ResponseStarted,
+		" response_started_at=", decision.ResponseStartedAt,
+		" suppress_until=", decision.SuppressUntil,
+		" defer_for=", delay.Round(time.Millisecond),
+		" age=", decision.Age.Round(time.Millisecond),
+		" last_active=", decision.LastActive,
+		" activity_seq=", decision.ActivitySeq,
 		" active=", active,
 		" draining=", draining,
-		" recent_misses=", missCount,
+		" src=", source,
+		" dst=", destination,
 	)
 }
 
-func (s *System) logTCPReset(family string, stage string, natPort uint16, flags header.TCPFlags, source netip.AddrPort, destination netip.AddrPort, tcpHdr header.TCP) {
-	if !flags.Contains(header.TCPFlagRst) {
-		return
-	}
-
+func (s *System) logDeferredAppRSTResult(family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, result AppRSTDeferredResult) {
 	active, draining := 0, 0
-	state := "unknown"
 	if s.tcpNat != nil {
 		active, draining = s.tcpNat.Stats()
-		state = s.tcpNat.State(natPort)
 	}
-	if stage == "listener" && state != "active" {
-		return
+	action := "cancel"
+	if result.Closed {
+		action = "apply"
 	}
-	if stage == "app" {
-		return
+	s.logger.Warn(
+		"[TCPLocal] ", action, " deferred app-rst family=", family,
+		" nat_port=", natPort,
+		" state=", result.State,
+		" reason=", result.Reason,
+		" age=", result.Age.Round(time.Millisecond),
+		" last_active=", result.LastActive,
+		" expected_activity_seq=", result.ExpectedActivitySeq,
+		" current_activity_seq=", result.ActivitySeq,
+		" close_nat=", result.Closed,
+		" active=", active,
+		" draining=", draining,
+		" src=", source,
+		" dst=", destination,
+	)
+}
+
+func (s *System) logAppRSTDecision(family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, decision AppRSTDecision) {
+	active, draining := 0, 0
+	if s.tcpNat != nil {
+		active, draining = s.tcpNat.Stats()
+	}
+	action := "pass"
+	if decision.Suppress {
+		action = "suppress"
 	}
 
 	s.logger.Warn(
-		"[TCPLocal] rst family=", family,
-		" stage=", stage,
+		"[TCPLocal] ", action, " app-rst family=", family,
 		" nat_port=", natPort,
-		" state=", state,
+		" state=", decision.State,
+		" reason=", decision.Reason,
+		" response_started=", decision.ResponseStarted,
+		" response_started_at=", decision.ResponseStartedAt,
+		" suppress_until=", decision.SuppressUntil,
+		" age=", decision.Age.Round(time.Millisecond),
+		" close_nat=", !decision.Suppress,
 		" active=", active,
 		" draining=", draining,
-		" flags=", flags,
-		" seq=", tcpHdr.SequenceNumber(),
-		" ack=", tcpHdr.AckNumber(),
 		" src=", source,
 		" dst=", destination,
 	)

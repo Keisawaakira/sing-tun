@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const appRSTDrainTimeout = 15 * time.Second
+
 type TCPNat struct {
 	timeout         time.Duration
 	drainTimeout    time.Duration
@@ -27,14 +29,54 @@ type tcpNatKey struct {
 
 type TCPSession struct {
 	sync.Mutex
-	Source            netip.AddrPort
-	Destination       netip.AddrPort
-	LastActive        time.Time
-	ClosingUntil      time.Time
-	Closed            bool
-	ResponseStarted   bool
-	ResponseStartedAt time.Time
-	AppRSTIgnoreUntil time.Time
+	Source                  netip.AddrPort
+	Destination             netip.AddrPort
+	LastActive              time.Time
+	ClosingUntil            time.Time
+	Closed                  bool
+	AppRSTClosed            bool
+	ActivitySeq             uint64
+	AppRSTDeferredScheduled bool
+	ResponseStarted         bool
+	ResponseStartedAt       time.Time
+	AppRSTPassLogged        bool
+}
+
+type AppRSTDecision struct {
+	Suppress              bool
+	Log                   bool
+	State                 string
+	Reason                string
+	ResponseStarted       bool
+	ResponseStartedAt     time.Time
+	SuppressUntil         time.Time
+	Age                   time.Duration
+	LastActive            time.Time
+	ActivitySeq           uint64
+	ScheduleDeferredClose bool
+}
+
+type AppRSTDeferredResult struct {
+	Closed              bool
+	State               string
+	Reason              string
+	LastActive          time.Time
+	Age                 time.Duration
+	ActivitySeq         uint64
+	ExpectedActivitySeq uint64
+}
+
+type TCPSessionSnapshot struct {
+	Found                   bool
+	State                   string
+	LastActive              time.Time
+	Age                     time.Duration
+	ClosingUntil            time.Time
+	AppRSTClosed            bool
+	ActivitySeq             uint64
+	AppRSTDeferredScheduled bool
+	ResponseStarted         bool
+	ResponseStartedAt       time.Time
 }
 
 func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {
@@ -119,6 +161,9 @@ func (n *TCPNat) LookupBack(port uint16) *TCPSession {
 	n.portAccess.RLock()
 	session := n.portMap[port]
 	n.portAccess.RUnlock()
+	if session != nil && n.isAppRSTClosed(session) {
+		return nil
+	}
 	if session != nil && !n.isClosed(session) {
 		n.touch(session)
 	}
@@ -139,9 +184,6 @@ func (n *TCPNat) Find(source netip.AddrPort, destination netip.AddrPort) (uint16
 	n.portAccess.RLock()
 	session := n.portMap[port]
 	n.portAccess.RUnlock()
-	if session != nil {
-		n.touch(session)
-	}
 	return port, session, session != nil
 }
 
@@ -212,6 +254,41 @@ func (n *TCPNat) DeletePort(port uint16) {
 	n.recentAccess.Unlock()
 }
 
+func (n *TCPNat) CloseByAppRST(port uint16) {
+	n.portAccess.RLock()
+	session := n.portMap[port]
+	n.portAccess.RUnlock()
+	if session == nil {
+		return
+	}
+
+	now := time.Now()
+	session.Lock()
+	session.Closed = true
+	session.AppRSTClosed = true
+	session.AppRSTDeferredScheduled = false
+	session.LastActive = now
+	closingUntil := now.Add(appRSTDrainTimeout)
+	if n.drainTimeout > 0 && n.drainTimeout < appRSTDrainTimeout {
+		closingUntil = now.Add(n.drainTimeout)
+	}
+	session.ClosingUntil = closingUntil
+	source := session.Source
+	destination := session.Destination
+	session.Unlock()
+
+	n.addrAccess.Lock()
+	delete(n.addrMap, tcpNatKey{
+		Source:      source,
+		Destination: destination,
+	})
+	n.addrAccess.Unlock()
+
+	n.recentAccess.Lock()
+	n.recentClosed[port] = closingUntil.Add(time.Minute)
+	n.recentAccess.Unlock()
+}
+
 func (n *TCPNat) MarkResponseStarted(port uint16) {
 	n.portAccess.RLock()
 	session := n.portMap[port]
@@ -227,16 +304,20 @@ func (n *TCPNat) MarkResponseStarted(port uint16) {
 	}
 	if !session.Closed {
 		session.LastActive = now
+		session.ActivitySeq++
 	}
 	session.Unlock()
 }
 
-func (n *TCPNat) ShouldSuppressAppRST(port uint16, debounce time.Duration) (bool, time.Time, time.Time, bool, string) {
+func (n *TCPNat) ShouldSuppressAppRST(port uint16, window time.Duration) AppRSTDecision {
 	n.portAccess.RLock()
 	session := n.portMap[port]
 	n.portAccess.RUnlock()
 	if session == nil {
-		return false, time.Time{}, time.Time{}, false, n.State(port)
+		return AppRSTDecision{
+			State:  n.State(port),
+			Reason: "missing_session",
+		}
 	}
 
 	now := time.Now()
@@ -247,22 +328,149 @@ func (n *TCPNat) ShouldSuppressAppRST(port uint16, debounce time.Duration) (bool
 	if session.Closed {
 		state = "draining"
 	}
-	if session.Closed || !session.ResponseStarted {
-		return false, session.ResponseStartedAt, session.AppRSTIgnoreUntil, session.ResponseStarted, state
+	decision := AppRSTDecision{
+		State:             state,
+		ResponseStarted:   session.ResponseStarted,
+		ResponseStartedAt: session.ResponseStartedAt,
+		LastActive:        session.LastActive,
+		ActivitySeq:       session.ActivitySeq,
 	}
-	if now.Before(session.AppRSTIgnoreUntil) {
-		return true, session.ResponseStartedAt, session.AppRSTIgnoreUntil, true, state
+	if session.Closed {
+		decision.Reason = "draining"
+		return decision
 	}
-	session.AppRSTIgnoreUntil = now.Add(debounce)
-	return true, session.ResponseStartedAt, session.AppRSTIgnoreUntil, true, state
+	if !session.ResponseStarted {
+		decision.Reason = "response_not_started"
+		return decision
+	}
+
+	if window < 0 {
+		window = 0
+	}
+	suppressUntil := session.ResponseStartedAt.Add(window)
+	decision.SuppressUntil = suppressUntil
+	decision.Age = now.Sub(session.ResponseStartedAt)
+	if now.Before(suppressUntil) {
+		decision.Suppress = true
+		decision.Reason = "within_response_window"
+		if !session.AppRSTDeferredScheduled {
+			session.AppRSTDeferredScheduled = true
+			decision.ScheduleDeferredClose = true
+			decision.Log = true
+		}
+		return decision
+	}
+
+	decision.Reason = "after_response_window"
+	if !session.AppRSTPassLogged {
+		session.AppRSTPassLogged = true
+		decision.Log = true
+	}
+	return decision
 }
 
 func (n *TCPNat) touch(session *TCPSession) {
 	session.Lock()
-	if !session.Closed && time.Since(session.LastActive) > time.Second {
-		session.LastActive = time.Now()
+	if !session.Closed {
+		session.ActivitySeq++
+		if time.Since(session.LastActive) > time.Second {
+			session.LastActive = time.Now()
+		}
 	}
 	session.Unlock()
+}
+
+func (n *TCPNat) CloseDeferredAppRST(port uint16, activitySeq uint64) AppRSTDeferredResult {
+	n.portAccess.RLock()
+	session := n.portMap[port]
+	n.portAccess.RUnlock()
+	if session == nil {
+		return AppRSTDeferredResult{
+			State:               n.State(port),
+			Reason:              "missing_session",
+			ExpectedActivitySeq: activitySeq,
+		}
+	}
+
+	now := time.Now()
+	session.Lock()
+	result := AppRSTDeferredResult{
+		State:               "active",
+		LastActive:          session.LastActive,
+		Age:                 now.Sub(session.LastActive),
+		ActivitySeq:         session.ActivitySeq,
+		ExpectedActivitySeq: activitySeq,
+	}
+	if session.Closed {
+		result.State = "draining"
+		result.Reason = "already_closed"
+		session.AppRSTDeferredScheduled = false
+		session.Unlock()
+		return result
+	}
+	if session.ActivitySeq != activitySeq {
+		result.Reason = "progress_after_rst"
+		session.AppRSTDeferredScheduled = false
+		session.Unlock()
+		return result
+	}
+	result.Reason = "deferred_rst"
+
+	session.Closed = true
+	session.AppRSTClosed = true
+	session.AppRSTDeferredScheduled = false
+	session.LastActive = now
+	closingUntil := now.Add(appRSTDrainTimeout)
+	if n.drainTimeout > 0 && n.drainTimeout < appRSTDrainTimeout {
+		closingUntil = now.Add(n.drainTimeout)
+	}
+	session.ClosingUntil = closingUntil
+	source := session.Source
+	destination := session.Destination
+	result.Closed = true
+	result.State = "draining"
+	session.Unlock()
+
+	n.addrAccess.Lock()
+	delete(n.addrMap, tcpNatKey{
+		Source:      source,
+		Destination: destination,
+	})
+	n.addrAccess.Unlock()
+
+	n.recentAccess.Lock()
+	n.recentClosed[port] = closingUntil.Add(time.Minute)
+	n.recentAccess.Unlock()
+	return result
+}
+
+func (n *TCPNat) Snapshot(port uint16) TCPSessionSnapshot {
+	n.portAccess.RLock()
+	session := n.portMap[port]
+	n.portAccess.RUnlock()
+	if session == nil {
+		return TCPSessionSnapshot{State: n.State(port)}
+	}
+
+	now := time.Now()
+	session.Lock()
+	defer session.Unlock()
+	state := "active"
+	if session.Closed {
+		state = "draining"
+	}
+	return TCPSessionSnapshot{
+		Found:                   true,
+		State:                   state,
+		LastActive:              session.LastActive,
+		Age:                     now.Sub(session.LastActive),
+		ClosingUntil:            session.ClosingUntil,
+		AppRSTClosed:            session.AppRSTClosed,
+		ActivitySeq:             session.ActivitySeq,
+		AppRSTDeferredScheduled: session.AppRSTDeferredScheduled,
+		ResponseStarted:         session.ResponseStarted,
+		ResponseStartedAt:       session.ResponseStartedAt,
+	}
 }
 
 func (n *TCPNat) Stats() (active int, draining int) {
@@ -310,4 +518,10 @@ func (n *TCPNat) isClosed(session *TCPSession) bool {
 	session.Lock()
 	defer session.Unlock()
 	return session.Closed
+}
+
+func (n *TCPNat) isAppRSTClosed(session *TCPSession) bool {
+	session.Lock()
+	defer session.Unlock()
+	return session.AppRSTClosed
 }
