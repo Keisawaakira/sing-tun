@@ -25,11 +25,6 @@ import (
 
 var ErrIncludeAllNetworks = E.New("`system` and `mixed` stack are not available when `includeAllNetworks` is enabled. See https://github.com/SagerNet/sing-tun/issues/25")
 
-const (
-	appRSTSuppressWindow        = time.Second
-	appRSTDeferredCloseMinDelay = 500 * time.Millisecond
-)
-
 type System struct {
 	ctx                  context.Context
 	tun                  Tun
@@ -61,6 +56,11 @@ type System struct {
 	frontHeadroom        int
 	txChecksumOffload    bool
 	recvMsgX             bool
+
+	lookupBackMisses      atomic.Uint64
+	lastLookupBackMissLog atomic.Int64
+	natExhaustedDrops     atomic.Uint64
+	lastNatExhaustedLog   atomic.Int64
 }
 
 type Session struct {
@@ -72,8 +72,6 @@ type Session struct {
 
 type responseTrackingTCPConn struct {
 	net.Conn
-	tcpNat        *TCPNat
-	natPort       uint16
 	startedAt     time.Time
 	localAddr     string
 	remoteAddr    string
@@ -99,11 +97,9 @@ type responseTrackingSnapshot struct {
 	lastWriteErr string
 }
 
-func newResponseTrackingTCPConn(conn net.Conn, tcpNat *TCPNat, natPort uint16) *responseTrackingTCPConn {
+func newResponseTrackingTCPConn(conn net.Conn) *responseTrackingTCPConn {
 	return &responseTrackingTCPConn{
 		Conn:       conn,
-		tcpNat:     tcpNat,
-		natPort:    natPort,
 		startedAt:  time.Now(),
 		localAddr:  tcpBridgeAddrString(conn.LocalAddr()),
 		remoteAddr: tcpBridgeAddrString(conn.RemoteAddr()),
@@ -127,7 +123,6 @@ func (c *responseTrackingTCPConn) Write(p []byte) (int, error) {
 	if n > 0 {
 		atomic.AddInt64(&c.writeBytes, int64(n))
 		atomic.StoreInt64(&c.lastWriteNano, time.Now().UnixNano())
-		c.markResponseStarted()
 	}
 	if err != nil {
 		c.setLastWriteErr(err)
@@ -180,13 +175,6 @@ func (c *responseTrackingTCPConn) setLastWriteErr(err error) {
 	c.errMu.Lock()
 	c.lastWriteErr = err.Error()
 	c.errMu.Unlock()
-}
-
-func (c *responseTrackingTCPConn) markResponseStarted() {
-	if c.tcpNat == nil {
-		return
-	}
-	c.tcpNat.MarkResponseStarted(c.natPort)
 }
 
 func NewSystem(options StackOptions) (Stack, error) {
@@ -362,6 +350,9 @@ func (s *System) wintunLoop(winTun WinTun) {
 			}
 		})
 		if err != nil {
+			if !E.IsClosed(err) {
+				s.logger.Error(E.Cause(err, "wintun read loop exited"))
+			}
 			return
 		}
 		if batchTun == nil {
@@ -370,6 +361,9 @@ func (s *System) wintunLoop(winTun WinTun) {
 		for {
 			packet, release, ok, err := batchTun.TryReadPacket()
 			if err != nil {
+				if !E.IsClosed(err) {
+					s.logger.Error(E.Cause(err, "wintun batch read loop exited"))
+				}
 				return
 			}
 			if !ok {
@@ -499,7 +493,7 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat) {
 			continue
 		}
 		go func(conn net.Conn, connPort uint16, source netip.AddrPort, destination netip.AddrPort) {
-			trackedConn := newResponseTrackingTCPConn(conn, tcpNat, connPort)
+			trackedConn := newResponseTrackingTCPConn(conn)
 			metadata := M.Metadata{
 				Source:      M.SocksaddrFromNetIP(source),
 				Destination: M.SocksaddrFromNetIP(destination),
@@ -508,24 +502,29 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat) {
 			connSnapshot := trackedConn.Snapshot()
 			natSnapshot := tcpNat.Snapshot(connPort)
 			s.logTCPBridgeDone(tcpNat, connPort, source, destination, connSnapshot, natSnapshot, handlerErr)
-			tcpNat.DeletePort(connPort)
+			// Close with RST (upstream semantics): the NAT session stays alive
+			// until idle timeout, so the RST is rewritten back to the app and
+			// tears the app-side connection down immediately instead of
+			// leaving it to drain against a dead socket.
+			if tcpConn, isTCPConn := conn.(*net.TCPConn); isTCPConn {
+				_ = tcpConn.SetLinger(0)
+			}
 			_ = trackedConn.Close()
 		}(conn, connPort, session.Source, session.Destination)
 	}
 }
 
 func (s *System) logTCPBridgeAcceptMissing(tcpNat *TCPNat, connPort uint16, conn net.Conn) {
-	active, draining := 0, 0
+	active := 0
 	state := "unknown"
 	if tcpNat != nil {
-		active, draining = tcpNat.Stats()
+		active = tcpNat.Stats()
 		state = tcpNat.State(connPort)
 	}
 	s.logger.Warn(
 		"[TCPLocal] bridge-accept-missing nat_port=", connPort,
 		" state=", state,
 		" active=", active,
-		" draining=", draining,
 		" local=", tcpBridgeAddrString(conn.LocalAddr()),
 		" remote=", tcpBridgeAddrString(conn.RemoteAddr()),
 	)
@@ -535,9 +534,9 @@ func (s *System) logTCPBridgeDone(tcpNat *TCPNat, natPort uint16, source netip.A
 	if !shouldLogTCPBridgeDone(connSnapshot, handlerErr) {
 		return
 	}
-	active, draining := 0, 0
+	active := 0
 	if tcpNat != nil {
-		active, draining = tcpNat.Stats()
+		active = tcpNat.Stats()
 	}
 	s.logger.Warn(
 		"[TCPLocal] bridge-done nat_port=", natPort,
@@ -552,15 +551,10 @@ func (s *System) logTCPBridgeDone(tcpNat *TCPNat, natPort uint16, source netip.A
 		" read_err=", connSnapshot.lastReadErr,
 		" write_err=", connSnapshot.lastWriteErr,
 		" handler_err=", handlerErr,
-		" response_started=", natSnapshot.ResponseStarted,
-		" response_started_at=", natSnapshot.ResponseStartedAt,
 		" last_active=", natSnapshot.LastActive,
 		" age=", natSnapshot.Age.Round(time.Millisecond),
 		" activity_seq=", natSnapshot.ActivitySeq,
-		" app_rst_closed=", natSnapshot.AppRSTClosed,
-		" deferred_app_rst=", natSnapshot.AppRSTDeferredScheduled,
 		" active=", active,
-		" draining=", draining,
 		" src=", source,
 		" dst=", destination,
 		" local=", connSnapshot.localAddr,
@@ -721,7 +715,8 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 	} else if source.Addr() == s.inet4Address && source.Port() == s.tcpPort {
 		session := s.tcpNat4.LookupBack(destination.Port())
 		if session == nil {
-			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
+			s.logLookupBackMiss(s.tcpNat4, "ipv4", destination.Port())
+			return false, nil
 		}
 		source = session.Destination
 		destination = session.Source
@@ -736,29 +731,10 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			var natPort uint16
-			if tcpHdr.Flags().Contains(header.TCPFlagRst) {
-				var loaded bool
-				natPort, _, loaded = s.tcpNat4.Find(source, destination)
-				if !loaded {
-					return false, nil
-				}
-				decision := s.tcpNat4.ShouldSuppressAppRST(natPort, appRSTSuppressWindow)
-				if decision.ScheduleDeferredClose {
-					s.deferAppRSTClose(s.tcpNat4, "ipv4", natPort, source, destination, decision)
-				} else if decision.Log && decision.Suppress {
-					s.logAppRSTDecision(s.tcpNat4, "ipv4", natPort, source, destination, decision)
-				}
-				if decision.Suppress {
-					return false, nil
-				}
-				s.tcpNat4.CloseByAppRST(natPort)
-			} else {
-				var err error
-				natPort, err = s.tcpNat4.Lookup(source, destination)
-				if err != nil {
-					return false, s.resetIPv4TCP(ipHdr, tcpHdr)
-				}
+			natPort, err := s.tcpNat4.Lookup(source, destination)
+			if err != nil {
+				s.logNatPortExhausted(s.tcpNat4, "ipv4", source, destination)
+				return false, s.resetIPv4TCP(ipHdr, tcpHdr)
 			}
 			source = netip.AddrPortFrom(s.inet4NextAddress, natPort)
 			destination = netip.AddrPortFrom(s.inet4Address, s.tcpPort)
@@ -824,7 +800,8 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	} else if source.Addr() == s.inet6Address && source.Port() == s.tcpPort6 {
 		session := s.tcpNat6.LookupBack(destination.Port())
 		if session == nil {
-			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
+			s.logLookupBackMiss(s.tcpNat6, "ipv6", destination.Port())
+			return false, nil
 		}
 		source = session.Destination
 		destination = session.Source
@@ -839,29 +816,10 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			var natPort uint16
-			if tcpHdr.Flags().Contains(header.TCPFlagRst) {
-				var loaded bool
-				natPort, _, loaded = s.tcpNat6.Find(source, destination)
-				if !loaded {
-					return false, nil
-				}
-				decision := s.tcpNat6.ShouldSuppressAppRST(natPort, appRSTSuppressWindow)
-				if decision.ScheduleDeferredClose {
-					s.deferAppRSTClose(s.tcpNat6, "ipv6", natPort, source, destination, decision)
-				} else if decision.Log && decision.Suppress {
-					s.logAppRSTDecision(s.tcpNat6, "ipv6", natPort, source, destination, decision)
-				}
-				if decision.Suppress {
-					return false, nil
-				}
-				s.tcpNat6.CloseByAppRST(natPort)
-			} else {
-				var err error
-				natPort, err = s.tcpNat6.Lookup(source, destination)
-				if err != nil {
-					return false, s.resetIPv6TCP(ipHdr, tcpHdr)
-				}
+			natPort, err := s.tcpNat6.Lookup(source, destination)
+			if err != nil {
+				s.logNatPortExhausted(s.tcpNat6, "ipv6", source, destination)
+				return false, s.resetIPv6TCP(ipHdr, tcpHdr)
 			}
 			source = netip.AddrPortFrom(s.inet6NextAddress, natPort)
 			destination = netip.AddrPortFrom(s.inet6Address, s.tcpPort6)
@@ -871,97 +829,46 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	return true, nil
 }
 
-func (s *System) deferAppRSTClose(tcpNat *TCPNat, family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, decision AppRSTDecision) {
-	delay := time.Until(decision.SuppressUntil)
-	if delay < appRSTDeferredCloseMinDelay {
-		delay = appRSTDeferredCloseMinDelay
+// logLookupBackMiss records reply-direction packets dropped because the NAT
+// no longer knows the port. Every dropped packet counts; log lines are
+// rate-limited to one per second to survive storms.
+func (s *System) logLookupBackMiss(tcpNat *TCPNat, family string, natPort uint16) {
+	misses := s.lookupBackMisses.Add(1)
+	now := time.Now().UnixNano()
+	last := s.lastLookupBackMissLog.Load()
+	if now-last < int64(time.Second) || !s.lastLookupBackMissLog.CompareAndSwap(last, now) {
+		return
 	}
-	s.logDeferredAppRSTSchedule(tcpNat, family, natPort, source, destination, decision, delay)
-	go func() {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			result := tcpNat.CloseDeferredAppRST(natPort, decision.ActivitySeq)
-			s.logDeferredAppRSTResult(tcpNat, family, natPort, source, destination, result)
-		case <-s.ctx.Done():
-			return
-		}
-	}()
-}
-
-func (s *System) logDeferredAppRSTSchedule(tcpNat *TCPNat, family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, decision AppRSTDecision, delay time.Duration) {
-	active, draining := 0, 0
+	active := 0
 	if tcpNat != nil {
-		active, draining = tcpNat.Stats()
+		active = tcpNat.Stats()
 	}
 	s.logger.Warn(
-		"[TCPLocal] defer app-rst family=", family,
+		"[TCPLocal] bridge-lookup-miss family=", family,
 		" nat_port=", natPort,
-		" state=", decision.State,
-		" reason=", decision.Reason,
-		" response_started=", decision.ResponseStarted,
-		" response_started_at=", decision.ResponseStartedAt,
-		" suppress_until=", decision.SuppressUntil,
-		" defer_for=", delay.Round(time.Millisecond),
-		" age=", decision.Age.Round(time.Millisecond),
-		" last_active=", decision.LastActive,
-		" activity_seq=", decision.ActivitySeq,
+		" total_misses=", misses,
 		" active=", active,
-		" draining=", draining,
-		" src=", source,
-		" dst=", destination,
 	)
 }
 
-func (s *System) logDeferredAppRSTResult(tcpNat *TCPNat, family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, result AppRSTDeferredResult) {
-	active, draining := 0, 0
+// logNatPortExhausted records forward-direction packets rejected because every
+// NAT port is occupied by a live session. This should never happen in normal
+// operation; if it fires, sessions are leaking or genuinely exceed ~55k.
+func (s *System) logNatPortExhausted(tcpNat *TCPNat, family string, source netip.AddrPort, destination netip.AddrPort) {
+	drops := s.natExhaustedDrops.Add(1)
+	now := time.Now().UnixNano()
+	last := s.lastNatExhaustedLog.Load()
+	if now-last < int64(time.Second) || !s.lastNatExhaustedLog.CompareAndSwap(last, now) {
+		return
+	}
+	active := 0
 	if tcpNat != nil {
-		active, draining = tcpNat.Stats()
+		active = tcpNat.Stats()
 	}
-	action := "cancel"
-	if result.Closed {
-		action = "apply"
-	}
-	s.logger.Warn(
-		"[TCPLocal] ", action, " deferred app-rst family=", family,
-		" nat_port=", natPort,
-		" state=", result.State,
-		" reason=", result.Reason,
-		" age=", result.Age.Round(time.Millisecond),
-		" last_active=", result.LastActive,
-		" expected_activity_seq=", result.ExpectedActivitySeq,
-		" current_activity_seq=", result.ActivitySeq,
-		" close_nat=", result.Closed,
+	s.logger.Error(
+		"[TCPLocal] nat-port-exhausted family=", family,
+		" total_drops=", drops,
 		" active=", active,
-		" draining=", draining,
-		" src=", source,
-		" dst=", destination,
-	)
-}
-
-func (s *System) logAppRSTDecision(tcpNat *TCPNat, family string, natPort uint16, source netip.AddrPort, destination netip.AddrPort, decision AppRSTDecision) {
-	active, draining := 0, 0
-	if tcpNat != nil {
-		active, draining = tcpNat.Stats()
-	}
-	action := "pass"
-	if decision.Suppress {
-		action = "suppress"
-	}
-
-	s.logger.Warn(
-		"[TCPLocal] ", action, " app-rst family=", family,
-		" nat_port=", natPort,
-		" state=", decision.State,
-		" reason=", decision.Reason,
-		" response_started=", decision.ResponseStarted,
-		" response_started_at=", decision.ResponseStartedAt,
-		" suppress_until=", decision.SuppressUntil,
-		" age=", decision.Age.Round(time.Millisecond),
-		" close_nat=", !decision.Suppress,
-		" active=", active,
-		" draining=", draining,
 		" src=", source,
 		" dst=", destination,
 	)
