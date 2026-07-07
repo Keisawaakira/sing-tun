@@ -39,6 +39,10 @@ type NativeTun struct {
 	fwpmSession    uintptr
 	fwpmSubLayer   windows.GUID
 	fwpmPermitApps map[string]struct{}
+
+	sendRingDrops       atomic.Uint64
+	sendRingDropBytes   atomic.Uint64
+	lastSendRingDropLog atomic.Int64
 }
 
 func New(options Options) (WinTun, error) {
@@ -590,6 +594,28 @@ retry:
 	}
 }
 
+// noteSendRingDrop makes silently dropped inject-direction packets visible:
+// every drop is counted, log lines are rate-limited to one per second. A full
+// send ring means the host stack stopped draining packets we write back into
+// the TUN, which starves established TCP flows without any socket error.
+func (t *NativeTun) noteSendRingDrop(packetSize int) {
+	drops := t.sendRingDrops.Add(1)
+	droppedBytes := t.sendRingDropBytes.Add(uint64(packetSize))
+	if t.options.Logger == nil {
+		return
+	}
+	now := nanotime()
+	last := t.lastSendRingDropLog.Load()
+	if now-last < int64(time.Second) || !t.lastSendRingDropLog.CompareAndSwap(last, now) {
+		return
+	}
+	t.options.Logger.Warn(
+		"wintun send ring full, dropping packet size=", packetSize,
+		" total_dropped=", drops,
+		" total_dropped_bytes=", droppedBytes,
+	)
+}
+
 func (t *NativeTun) Write(p []byte) (n int, err error) {
 	t.running.Add(1)
 	defer t.running.Done()
@@ -614,6 +640,7 @@ func (t *NativeTun) Write(p []byte) (n int, err error) {
 				procyield(spinloopCycles)
 				continue
 			}
+			t.noteSendRingDrop(len(p))
 			return 0, nil // Dropping when ring is full.
 		}
 		return 0, fmt.Errorf("write failed: %w", allocErr)
@@ -651,6 +678,7 @@ func (t *NativeTun) write(packetElementList [][]byte) (n int, err error) {
 				procyield(spinloopCycles)
 				continue
 			}
+			t.noteSendRingDrop(packetSize)
 			return 0, nil // Dropping when ring is full.
 		}
 		return 0, fmt.Errorf("write failed: %w", allocErr)

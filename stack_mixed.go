@@ -107,6 +107,9 @@ func (m *Mixed) wintunLoop(winTun WinTun) {
 			}
 		})
 		if err != nil {
+			if !E.IsClosed(err) {
+				m.logger.Error(E.Cause(err, "wintun read loop exited"))
+			}
 			return
 		}
 		if batchTun == nil {
@@ -115,6 +118,9 @@ func (m *Mixed) wintunLoop(winTun WinTun) {
 		for {
 			packet, release, ok, err := batchTun.TryReadPacket()
 			if err != nil {
+				if !E.IsClosed(err) {
+					m.logger.Error(E.Cause(err, "wintun batch read loop exited"))
+				}
 				return
 			}
 			if !ok {
